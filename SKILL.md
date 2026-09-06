@@ -1,6 +1,6 @@
 ---
 name: tandem
-description: Dauerhafte Kooperation mit Codex (OpenAI CLI) über ein ganzes Projekt hinweg — ein Codex-Thread pro Projekt mit Gedächtnis statt Einzel-Briefings. Kern (Plan A): Begleiter (Checkpoints nach Protokoll mit JSON-Verdicts), Plan-Konsens mit Automode (max. 3 Runden, Umsetzung bei Konsens ohne Nutzer), Abschluss mit zwei Urteilen (Thread + frischer Diff-Review), Status/Pause/Rotation, Kosten-Zähler und Nutzungs-Wächter (Restnutzung prüfen, unter Schwelle kein Aufruf). Alle Codex-Aufrufe laufen über den Runner scripts/tandem.mjs. Trigger: /tandem (optional /tandem <befehl>). Sparring, Arbeitsteilung, Design-Galerie und Board folgen in Plan B–D.
+description: Dauerhafte Kooperation mit Codex (OpenAI CLI) über ein ganzes Projekt hinweg — ein Codex-Thread pro Projekt mit Gedächtnis statt Einzel-Briefings. Begleiter (Checkpoints nach Protokoll mit JSON-Verdicts), Plan-Konsens mit Automode (max. 3 Runden, Umsetzung bei Konsens ohne Nutzer), Abschluss mit zwei Urteilen (Thread + frischer Diff-Review), Sparring und Fork-Lanes (Gegenposition, Premortem, Alternative), Arbeitsteilung mit sandbox-erzwungenen Worker-Zonen und Zuteilung nach Stärken, Status/Pause/Rotation, Kosten-Zähler und Nutzungs-Wächter (Restnutzung prüfen, unter Schwelle kein Aufruf). Alle Codex-Aufrufe laufen über den Runner scripts/tandem.mjs. Trigger: /tandem (optional /tandem <befehl>). Design-Galerie und Board folgen in Plan C–D.
 ---
 
 # Tandem (Kern)
@@ -76,6 +76,35 @@ Eigener Planungsfluss; die Nutzer-Freigabe des Plans übernimmt der Konsens (Ent
 3. Echte Bugs selbst fixen, Ergebnis mit Fix-Disposition im Ledger festhalten, dann erst „fertig" (`superpowers:verification-before-completion`). Ersetzt den Duofold-/Trifold-Abschluss-Bug-Check, solange tandem aktiv ist.
 
 Im Abschluss-Bericht den Stand aus `status --human` nennen: Kontakte, Tokens, Restnutzung.
+
+---
+
+## Sparring (`/tandem frag <text>`) und Lanes (`/tandem lane <art> <thema>`)
+
+- **Sparring:** freie Frage an den Thread (Idee, Architektur, Bug-Hypothese). Prompt-Datei mit Frage + Kontext, dann `contact --kind sparring --prompt-file <abs>` (Effort medium). Antwort: `position`, `reasons`, `checked`, `risks`, `recommendation`. Erkenntnis in einem Satz ins Ledger („Entscheidungen" oder „Stand").
+- **Lanes:** `lane --kind gegenposition|premortem|alternative --prompt-file <abs>`. Ein ephemerer Fork des Threads: kennt alles, seine Antwort landet nicht im Hauptthread. Nur das Destillat ins Ledger; beim nächsten regulären Kontakt in zwei Sätzen erwähnen, was die Lane ergab. Gegenposition vor großen Entscheidungen, Premortem vor riskanten Umsetzungen, Alternative wenn ein Weg alternativlos wirkt.
+
+---
+
+## Arbeitsteilung (`/tandem worker <zone> <auftrag>`)
+
+Codex erledigt eine abgegrenzte Teilaufgabe **mit Schreibrecht**, parallel und im Hintergrund, in einer **Zone** (Ordner), die die Sandbox erzwingt.
+
+**Zuteilung nach Stärken** (wer macht was):
+
+| An Codex als Worker | Bei Claude |
+|---|---|
+| Tests und Fixtures für vorhandenen Code; Parser, Validator, Konverter gegen eine Spezifikation; Modul-Portierung nach Vorlage; Migrationen mit klarer Zielstruktur; Repo-Recherche mit Bericht; Referenz-Doku aus Code; Audit einer Zone | UI/UX, Texte für den Nutzer, visuelle Prüfung im Browser; Architektur- und Scope-Entscheidungen; Änderungen quer über viele Ordner; Integration der Worker-Ergebnisse; Ledger und Entscheidungen; Sicherheitskritisches mit Nutzer-Stopp |
+| Kriterium: Ziel lässt sich in Akzeptanztests fassen, die in der Zone laufen, und braucht keinen Kontext außerhalb von Brief + Repo | Kriterium: braucht Nutzerkontakt, Geschmack, Gesamtkontext oder Schreibrecht außerhalb einer Zone |
+
+Bewährte Muster: Claude baut Skelett und Schnittstellen, Codex füllt Zonen mit Implementierung und Tests; Codex schreibt zuerst die Tests einer Zone, Claude implementiert; Codex auditiert eine Zone, während Claude woanders weiterbaut. Passt ein Auftrag in keine Codex-Kategorie, macht Claude ihn selbst.
+
+1. **Zone wählen:** ein Unterordner des Projekts, der nur Dateien des Auftrags enthält. Nie das Projekt-Root, nie `.tandem/`, nie Ordner mit `node_modules`, `dist`, `build`, `.next`, `target`, `.git`, keine Junctions (auch nicht im Pfad), nicht unter `%TEMP%`, keine Überlappung mit einer aktiven Zone. Höchstens **zwei** Worker gleichzeitig.
+2. **Handover-Brief** nach `references/templates/worker-brief.md` schreiben (absoluter Pfad); **alle** Überschriften der Vorlage sind Pflicht, darunter `## Auftragstyp` (Kategorie + ein Satz, warum der Auftrag zu Codex passt) und `## Kontext aus dem Ledger`. Der Runner hängt den Worker-Vertrag mit kanonischem Projekt- und Zonenpfad an.
+3. `worker start --zone <abs> --brief-file <abs>` (Effort medium, `high` bei Security/Migration; Deadline 20 min; optional `--model <name>`, wenn der Nutzer für mechanische Aufträge ein schnelleres Codex-Modell wünscht). Ledger-Zeile unter „Zonen und Worker".
+4. **Solange der Worker aktiv ist (running, finishing, killing), die Zone nicht anfassen.** Weiterarbeiten außerhalb; Checkpoints laufen normal.
+5. `worker wait <id>` (im Hintergrund per Bash `run_in_background`) oder `worker status`. Ergebnis `DONE|PARTIAL|BLOCKED` mit `touchedFiles`, `tests`, `remaining`, `blockers`; ein ungültiges Ergebnis wird einmal per Resume nachgefordert (`retry_pending`, falls der Wächter den Retry gerade ablehnt).
+6. **Echten Diff prüfen** (Git: `git status`/`git diff -- <zone>`; ohne Git: Dateiliste), Tests selbst ausführen, integrieren, dann ein Begleiter-Checkpoint zur Integration. `timeout`, `orphaned`, `failed`, `invalid_output`: Log unter `.tandem/workers/<id>/log.txt` lesen, Zone prüfen, Auftrag ggf. enger fassen und neu starten. `worker cancel <id>` bricht ab; `stop` bricht alle ab. Bleibt ein Worker in `killing` (Kill nicht bestätigt oder Identität unbekannt), Prozess mit der gemeldeten PID prüfen und dem Nutzer melden; die Zone bleibt bis dahin reserviert.
 
 ---
 

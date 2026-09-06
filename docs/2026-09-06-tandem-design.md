@@ -402,6 +402,11 @@ Jeder Prompt enthält einen **Output-Cap** (max. Punkte, max. Zeilen). Die Anzah
 - 80 Tests grün (Fake-Codex), Smoke gegen echtes Codex 0.153.2 (doctor, start, checkpoint, status) bestanden.
 - Vier Review-Durchgänge mit tandem selbst (zwei frische Diff-Reviews, zwei Final-Kontakte auf dem Dauer-Thread): 18 Code-Befunde, alle behoben. Wichtigste Änderungen gegenüber dem Plan: Abschluss-Review als frischer `codex exec`-Thread (nicht `codex exec review`), unveränderlicher Lock mit offenem fd und mtime-Heartbeat plus `lock_lost`-Schutz beim Speichern, semantische Verdict-Prüfung (Urteil vs. Schwere, Restrisiko, ID-Präfix, newEvidence ab Runde 2), Kontakt-Verbuchung bei Wächter-Ablehnung vor dem Retry, Plan-Archive erst nach gültigem Urteil, Ref-Prüfung vor Reviews, kein Modellaufruf bei unlesbarem Prompt.
 - Schlussurteil des Dauer-Threads: OK („für den Start von Plan B ist keine strukturelle Lücke mehr erkennbar").
+
+**Abnahme Plan B (2026-09-06)**
+- Worker (Zonen per Sandbox mit realpath-Prüfung, detached ohne Shell, verifizierte Prozessidentität, Deadlines, strukturierte Rückgabe mit einem budgetgeprüften Schema-Retry), Sparring-Kontakte, Fork-Lanes, Zuteilung nach Stärken; `status` und `stop` kennen Worker.
+- Plan B wurde als erster echter Plan-Konsens über den Dauer-Thread des Skill-Repos verhandelt: drei Runden, 16 Einwände, alle übernommen; nach Runde 3 ohne Konsens Entscheidung des Nutzers, P3-1 bis P3-4 einzuarbeiten und zu bauen.
+- Verifiziert gegen echtes Codex: `codex exec fork --ephemeral` mit Schema (Lane) und ein Worker in einer Zone inklusive sicherem Isolations-Negativtest (Smoke `tests/smoke-workers.mjs`).
 - Spec freigegeben; nächster Schritt writing-plans, danach Duofold-Prüfung des Plans.
 
 **Codex-Review (Duofold, Modus idee, Standard), eingearbeitet**

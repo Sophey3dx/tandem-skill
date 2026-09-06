@@ -404,6 +404,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import {
   acquireLock, addUsage, defaultState, emptyUsage, loadState, saveState, stateExists, withLock
@@ -459,6 +460,27 @@ test("withLock releases even when fn throws", async () => {
   const dir = project();
   await assert.rejects(withLock(dir, async () => { throw new Error("boom"); }), /boom/);
   assert.equal(fs.existsSync(tandemLayout(dir).lockFile), false);
+});
+
+test("release only removes the caller's own lock", () => {
+  const dir = project();
+  const { lockFile } = tandemLayout(dir);
+  const release = acquireLock(dir);
+  fs.writeFileSync(lockFile, JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token: "someone-else" }));
+  release();
+  assert.equal(fs.existsSync(lockFile), true, "foreign lock must survive");
+  fs.unlinkSync(lockFile);
+});
+
+test("acquireLock is atomic across processes", async () => {
+  const dir = project();
+  const stateUrl = new URL("../scripts/lib/state.mjs", import.meta.url).href;
+  const script = `import { acquireLock } from ${JSON.stringify(stateUrl)}; const release = acquireLock(process.argv[1]); setTimeout(() => { release(); }, 1500);`;
+  const child = spawn(process.execPath, ["--input-type=module", "-e", script, dir], { stdio: "ignore" });
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  assert.throws(() => acquireLock(dir), (e) => e.code === "locked");
+  await new Promise((resolve) => child.on("exit", resolve));
+  acquireLock(dir)();
 });
 
 test("addUsage sums into total, session and byKind", () => {
@@ -556,34 +578,58 @@ function pidAlive(pid) {
   }
 }
 
+function readLock(lockFile) {
+  try {
+    return JSON.parse(fs.readFileSync(lockFile, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function isStale(lock) {
+  if (!lock) return true;
+  const age = lock.at ? Date.now() - Date.parse(lock.at) : Number.POSITIVE_INFINITY;
+  return lock.pid === process.pid || !pidAlive(lock.pid) || age > LOCK_STALE_MS;
+}
+
+// Atomic: the lock file is created with "wx" (fails if it exists). A stale lock is removed once and the
+// creation retried. Release only deletes the file if it still carries our token.
 export function acquireLock(projectRoot) {
   const { root, lockFile } = tandemLayout(projectRoot);
   fs.mkdirSync(root, { recursive: true });
-  if (fs.existsSync(lockFile)) {
-    let lock = null;
+  const token = `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+  const payload = JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token });
+  for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
-      lock = JSON.parse(fs.readFileSync(lockFile, "utf8"));
-    } catch {
-      lock = null;
-    }
-    const age = lock?.at ? Date.now() - Date.parse(lock.at) : Number.POSITIVE_INFINITY;
-    const stale = !lock || lock.pid === process.pid || !pidAlive(lock.pid) || age > LOCK_STALE_MS;
-    if (!stale) {
-      throw new TandemError(
-        "locked",
-        `Another tandem command is running (pid ${lock.pid} since ${lock.at}).`,
-        "Wait for it to finish, or delete .tandem/lock if that process is dead."
-      );
+      const fd = fs.openSync(lockFile, "wx");
+      fs.writeSync(fd, payload);
+      fs.closeSync(fd);
+      return () => {
+        if (readLock(lockFile)?.token !== token) return;
+        try {
+          fs.unlinkSync(lockFile);
+        } catch {
+          // already gone
+        }
+      };
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+      const existing = readLock(lockFile);
+      if (!isStale(existing)) {
+        throw new TandemError(
+          "locked",
+          `Another tandem command is running (pid ${existing.pid} since ${existing.at}).`,
+          "Wait for it to finish, or delete .tandem/lock if that process is dead."
+        );
+      }
+      try {
+        fs.unlinkSync(lockFile);
+      } catch {
+        // raced with the owner; retry below
+      }
     }
   }
-  fs.writeFileSync(lockFile, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }), "utf8");
-  return () => {
-    try {
-      fs.unlinkSync(lockFile);
-    } catch {
-      // already gone
-    }
-  };
+  throw new TandemError("locked", "Could not acquire .tandem/lock.", "Retry in a moment.");
 }
 
 export async function withLock(projectRoot, fn) {
@@ -611,7 +657,7 @@ export function addUsage(state, kind, usage) {
 - [ ] **Step 4: Test laufen lassen, Erfolg prüfen**
 
 Run: `node --test tests/state.test.mjs`
-Expected: `# pass 5`, `# fail 0`.
+Expected: `# pass 7`, `# fail 0` (der Cross-Process-Test dauert ~2 s).
 
 - [ ] **Step 5: Commit**
 
@@ -762,6 +808,17 @@ test("parseReplyFile handles missing file, invalid JSON and valid reply", () => 
   fs.writeFileSync(goodFile, JSON.stringify(OK_VERDICT), "utf8");
   assert.deepEqual(parseReplyFile(goodFile, "verdict").parsed, OK_VERDICT);
 });
+
+test("parseReplyFile enforces the point caps (5 for verdict, 8 for plan-verdict)", () => {
+  const tmp = path.join(HERE, ".tmp");
+  fs.mkdirSync(tmp, { recursive: true });
+  const point = (i) => ({ id: `C1-${i}`, severity: "MINOR", text: "x", file: null, line: null });
+  const tooMany = path.join(tmp, "toomany.json");
+  fs.writeFileSync(tooMany, JSON.stringify({ ...OK_VERDICT, points: [1, 2, 3, 4, 5, 6].map(point) }), "utf8");
+  const result = parseReplyFile(tooMany, "verdict");
+  assert.equal(result.parsed, null);
+  assert.ok(result.errors.some((e) => e.includes("$.points: more than 5")));
+});
 ```
 
 - [ ] **Step 3: Test laufen lassen, Fehlschlag prüfen**
@@ -827,6 +884,9 @@ export function validate(schema, value, at = "$") {
   return errors;
 }
 
+// Caps are enforced here, not in the schema files: OpenAI strict mode does not reliably accept maxItems.
+export const POINT_CAPS = { verdict: 5, "plan-verdict": 8 };
+
 export function parseReplyFile(file, schemaName) {
   if (!fs.existsSync(file)) return { parsed: null, errors: [`reply file missing: ${file}`], raw: null };
   const raw = fs.readFileSync(file, "utf8");
@@ -837,6 +897,8 @@ export function parseReplyFile(file, schemaName) {
     return { parsed: null, errors: [`reply is not JSON: ${error.message}`], raw };
   }
   const errors = validate(loadSchema(schemaName), value);
+  const cap = POINT_CAPS[schemaName];
+  if (cap && Array.isArray(value?.points) && value.points.length > cap) errors.push(`$.points: more than ${cap} items`);
   return { parsed: errors.length === 0 ? value : null, errors, raw };
 }
 ```
@@ -844,7 +906,7 @@ export function parseReplyFile(file, schemaName) {
 - [ ] **Step 5: Test laufen lassen, Erfolg prüfen**
 
 Run: `node --test tests/schema.test.mjs`
-Expected: `# pass 5`, `# fail 0`.
+Expected: `# pass 6`, `# fail 0`.
 
 - [ ] **Step 6: Commit**
 
@@ -952,9 +1014,9 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: `TandemError` (Task 1).
-- Produces (codex.mjs): `EFFORTS`, `normalizeEffort(v)`, `minutes(v)`, `resolveCodex(env) → { cmd, prefix }`, `killTree(pid)`, `parseJsonl(text)`, `classifyFailure({status,timedOut,stderr,stdout}) → null | "timeout"|"thread_lost"|"quota"|"auth"|"codex_failed"`, `runCodex({ args, promptFile, cwd, timeoutMs, env, logFile }) → { status, timedOut, stdout, stderr, events, durationMs, spawnError, failure }`, `threadIdFromEvents(events)`, `readLastMessage(file)`, `codexVersion(env)`, `loginStatus(env) → { loggedIn, detail }`, `buildStartArgs({ project, effort, outFile })`, `buildResumeArgs({ threadId, effort, schemaPath, outFile })`, `failureToError(result, kind) → TandemError`.
+- Produces (codex.mjs): `EFFORTS`, `KILL_GRACE_MS`, `normalizeEffort(v)`, `minutes(v)`, `resolveCodex(env) → { cmd, prefix }`, `killTree(pid, env) → boolean`, `parseJsonl(text)`, `classifyFailure({status,timedOut,stderr,stdout}) → null | "timeout"|"thread_lost"|"quota"|"auth"|"codex_failed"`, `runCodex({ args, promptFile, cwd, timeoutMs, env, logFile }) → { status, timedOut, killed, pid, stdout, stderr, events, durationMs, spawnError, failure }` (löst nach Timeout garantiert auf, spätestens nach `KILL_GRACE_MS`), `threadIdFromEvents(events)`, `readLastMessage(file)`, `codexVersion(env)`, `loginStatus(env) → { loggedIn, detail }`, `buildStartArgs({ project, effort, outFile })`, `buildResumeArgs({ threadId, effort, schemaPath, outFile })`, `failureToError(result, kind) → TandemError`.
 - Produces (helpers.mjs): `SKILL_ROOT`, `RUNNER`, `FAKE`, `makeProject(name)`, `runTandem(args, { cwd, env })` → `{ status, json, stdout, stderr }`, `writeFile(dir, name, content)`, `readLog(file)`, `startProject(dir, env)`.
-- Fake-Codex-Steuerung per Env: `FAKE_CODEX_MODE` (`ok|hang|fail|thread_lost|quota|auth|invalid_json`), `FAKE_CODEX_LOG` (JSONL-Protokoll je Aufruf: `{argv, stdin, cwd}`), `FAKE_THREAD_ID`, `FAKE_CODEX_REPLY`, `FAKE_VERDICT` (`OK|CONCERN|BLOCK`), `FAKE_PLAN_VERDICT` (`APPROVE|REVISE`), `FAKE_USED_PRIMARY`, `FAKE_USED_SECONDARY` (Prozent).
+- Fake-Codex-Steuerung per Env: `FAKE_CODEX_MODE` (`ok|hang|fail|thread_lost|quota|auth|invalid_json`), `FAKE_CODEX_LOG` (JSONL-Protokoll je Aufruf: `{argv, stdin, cwd}`), `FAKE_THREAD_ID`, `FAKE_CODEX_REPLY`, `FAKE_VERDICT` (`OK|CONCERN|BLOCK`), `FAKE_PLAN_VERDICT` (`APPROVE|REVISE`), `FAKE_PLAN_RISK` (Text für `criteria.residualRisk`), `FAKE_USED_PRIMARY`, `FAKE_USED_SECONDARY` (Prozent), `FAKE_RATELIMIT_MODE` (`ok|error|silent|crash`). `TANDEM_TEST_NO_KILL=1` lässt `killTree` nichts tun (nur Tests).
 
 - [ ] **Step 1: Fake-Codex schreiben** (`tests/fake-codex.mjs`)
 
@@ -989,7 +1051,7 @@ function sampleFor(schema) {
     return {
       verdict,
       checked: ["plan.md"],
-      criteria: { blockersOpen: verdict === "APPROVE" ? 0 : 1, sourcesRead: true, testStrategyFeasible: true, residualRisk: "gering" },
+      criteria: { blockersOpen: verdict === "APPROVE" ? 0 : 1, sourcesRead: true, testStrategyFeasible: true, residualRisk: process.env.FAKE_PLAN_RISK ?? "gering" },
       points: verdict === "APPROVE" ? [] : [{ id: "P1-1", severity: "MAJOR", category: "correctness", text: "fake objection", section: "Task 1", newEvidence: null }]
     };
   }
@@ -1008,6 +1070,9 @@ function sampleFor(schema) {
 
 function appServer() {
   const used = { primary: Number(process.env.FAKE_USED_PRIMARY ?? 18), secondary: Number(process.env.FAKE_USED_SECONDARY ?? 6) };
+  // FAKE_RATELIMIT_MODE: ok (default) | error (JSON-RPC error) | silent (never answers) | crash (exit before answering)
+  const limitMode = process.env.FAKE_RATELIMIT_MODE ?? "ok";
+  if (limitMode === "crash") process.exit(3);
   let buffer = "";
   process.stdin.setEncoding("utf8");
   process.stdin.on("data", (chunk) => {
@@ -1025,6 +1090,10 @@ function appServer() {
       }
       if (message.method === "initialize") {
         process.stdout.write(`${JSON.stringify({ id: message.id, result: { userAgent: "fake-app-server" } })}\n`);
+      } else if (message.method === "account/rateLimits/read" && limitMode === "silent") {
+        // never answer; the runner must time out and fail open
+      } else if (message.method === "account/rateLimits/read" && limitMode === "error") {
+        process.stdout.write(`${JSON.stringify({ id: message.id, error: { code: -32000, message: "fake rate limit error" } })}\n`);
       } else if (message.method === "account/rateLimits/read") {
         const result = {
           rateLimits: {
@@ -1163,7 +1232,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import {
-  buildResumeArgs, buildStartArgs, classifyFailure, failureToError, minutes, normalizeEffort,
+  KILL_GRACE_MS, buildResumeArgs, buildStartArgs, classifyFailure, failureToError, killTree, minutes, normalizeEffort,
   parseJsonl, resolveCodex, runCodex, threadIdFromEvents
 } from "../scripts/lib/codex.mjs";
 import { FAKE, makeProject, readLog, writeFile } from "./helpers.mjs";
@@ -1214,7 +1283,23 @@ test("runCodex kills a hanging process after the deadline", async () => {
   });
   assert.equal(result.timedOut, true);
   assert.equal(result.failure, "timeout");
+  assert.equal(result.killed, true);
   assert.ok(Date.now() - started < 15000);
+});
+
+test("runCodex still resolves when the kill fails (grace period), caller cleans up", async () => {
+  const dir = makeProject("nokill");
+  const prompt = writeFile(dir, "prompt.md", "x");
+  const started = Date.now();
+  const result = await runCodex({
+    args: ["exec", "--json", "-"], promptFile: prompt, cwd: dir, timeoutMs: 1000,
+    env: env({ FAKE_CODEX_MODE: "hang", TANDEM_TEST_NO_KILL: "1" })
+  });
+  assert.equal(result.timedOut, true);
+  assert.equal(result.killed, false);
+  assert.equal(result.failure, "timeout");
+  assert.ok(Date.now() - started < 1000 + KILL_GRACE_MS + 3000);
+  killTree(result.pid);
 });
 
 test("classifyFailure maps known error texts", () => {
@@ -1288,16 +1373,20 @@ export function resolveCodex(env = process.env) {
   );
 }
 
-export function killTree(pid) {
-  if (!pid) return;
+export const KILL_GRACE_MS = 5000;
+
+// Returns true when the kill command reported success. TANDEM_TEST_NO_KILL=1 skips the kill (tests only).
+export function killTree(pid, env = process.env) {
+  if (!pid || env.TANDEM_TEST_NO_KILL === "1") return false;
   if (process.platform === "win32") {
-    spawnSync("taskkill", ["/pid", String(pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
-  } else {
-    try {
-      process.kill(pid, "SIGKILL");
-    } catch {
-      // already gone
-    }
+    const result = spawnSync("taskkill", ["/pid", String(pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
+    return result.status === 0;
+  }
+  try {
+    process.kill(pid, "SIGKILL");
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -1350,10 +1439,14 @@ export function runCodex({ args, promptFile = null, cwd, timeoutMs, env = proces
     let stdout = "";
     let stderr = "";
     let timedOut = false;
+    let killed = false;
     let settled = false;
+    let graceTimer = null;
     const timer = setTimeout(() => {
       timedOut = true;
-      killTree(child.pid);
+      killed = killTree(child.pid, env);
+      // If "close" never arrives (kill failed, handles held), resolve anyway after a grace period.
+      graceTimer = setTimeout(() => finish(null), KILL_GRACE_MS);
     }, timeoutMs);
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk) => { stdout += chunk; });
@@ -1364,6 +1457,9 @@ export function runCodex({ args, promptFile = null, cwd, timeoutMs, env = proces
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (graceTimer) clearTimeout(graceTimer);
+      child.stdout.removeAllListeners("data");
+      child.stderr.removeAllListeners("data");
       if (logFile) {
         try {
           fs.writeFileSync(logFile, `# command\n${JSON.stringify([cmd, ...fullArgs])}\n# stdout\n${stdout}\n# stderr\n${stderr}\n`, "utf8");
@@ -1371,7 +1467,7 @@ export function runCodex({ args, promptFile = null, cwd, timeoutMs, env = proces
           // logging is best effort
         }
       }
-      const result = { status, timedOut, stdout, stderr, events: parseJsonl(stdout), durationMs: Date.now() - started, spawnError };
+      const result = { status, timedOut, killed, pid: child.pid, stdout, stderr, events: parseJsonl(stdout), durationMs: Date.now() - started, spawnError };
       result.failure = spawnError ? "codex_failed" : classifyFailure(result);
       resolve(result);
     };
@@ -1425,7 +1521,7 @@ export function buildResumeArgs({ threadId, effort, schemaPath, outFile }) {
 - [ ] **Step 6: Test laufen lassen, Erfolg prüfen**
 
 Run: `node --test tests/codex.test.mjs`
-Expected: `# pass 6`, `# fail 0` (der Hang-Test dauert ~2 s).
+Expected: `# pass 7`, `# fail 0` (die Hang-Tests dauern zusammen ~8 s).
 
 - [ ] **Step 7: Commit**
 
@@ -1492,6 +1588,25 @@ test("ensureBudget throws quota_low under threshold, passes with --min-remaining
   const limits = await ensureBudget(state, { env: env({ FAKE_USED_PRIMARY: "97" }), minRemaining: 0 });
   assert.equal(limits.primary.remainingPercent, 3);
 });
+
+test("guard fails open when the query errors, times out or crashes", async () => {
+  const state = defaultState("x");
+  const errored = await readRateLimits({ env: env({ FAKE_RATELIMIT_MODE: "error" }), timeoutMs: 10000 });
+  assert.equal(errored.error, "fake rate limit error");
+  const silent = await readRateLimits({ env: env({ FAKE_RATELIMIT_MODE: "silent" }), timeoutMs: 1500 });
+  assert.equal(silent.error, "timeout");
+  const crashed = await readRateLimits({ env: env({ FAKE_RATELIMIT_MODE: "crash" }), timeoutMs: 10000 });
+  assert.ok(crashed.error);
+  const limits = await ensureBudget(state, { env: env({ FAKE_RATELIMIT_MODE: "error", FAKE_USED_PRIMARY: "99" }) });
+  assert.equal(limits.error, "fake rate limit error");
+  assert.equal(state.rateLimits.error, "fake rate limit error");
+});
+
+test("minRemainingOf validates the range", () => {
+  for (const bad of ["abc", "-1", "101", "Infinity"]) {
+    assert.throws(() => minRemainingOf({ "min-remaining": bad }), (e) => e.code === "bad_config", bad);
+  }
+});
 ```
 
 - [ ] **Step 2: Test laufen lassen, Fehlschlag prüfen**
@@ -1544,7 +1659,7 @@ export function readRateLimits({ env = process.env, timeoutMs = 15000 } = {}) {
       } catch {
         // ignore
       }
-      setTimeout(() => killTree(child.pid), 200);
+      if (child.exitCode === null) killTree(child.pid, env); // synchronous; the pid is still ours here
       resolve(value);
     };
     const timer = setTimeout(() => finish({ error: "timeout" }), timeoutMs);
@@ -1580,7 +1695,12 @@ export function readRateLimits({ env = process.env, timeoutMs = 15000 } = {}) {
 }
 
 export function minRemainingOf(options = {}) {
-  return options["min-remaining"] === undefined ? undefined : Number(options["min-remaining"]);
+  if (options["min-remaining"] === undefined) return undefined;
+  const value = Number(options["min-remaining"]);
+  if (!Number.isFinite(value) || value < 0 || value > 100) {
+    throw new TandemError("bad_config", `--min-remaining must be a number between 0 and 100, got "${options["min-remaining"]}".`);
+  }
+  return value;
 }
 
 export function budgetViolation(limits, minRemaining) {
@@ -1613,7 +1733,7 @@ export async function ensureBudget(state, { minRemaining, env = process.env } = 
 - [ ] **Step 4: Test laufen lassen, Erfolg prüfen**
 
 Run: `node --test tests/ratelimits.test.mjs`
-Expected: `# pass 5`, `# fail 0`.
+Expected: `# pass 7`, `# fail 0` (der Silent-Test dauert ~1,5 s).
 
 - [ ] **Step 5: Commit**
 
@@ -1860,7 +1980,7 @@ Expected: FAIL (Runner-Datei fehlt, `json` ist null).
 import { codexVersion, loginStatus, resolveCodex } from "../lib/codex.mjs";
 import { isUnderTemp } from "../lib/paths.mjs";
 import { readRateLimits } from "../lib/ratelimits.mjs";
-import { loadState, saveState, stateExists } from "../lib/state.mjs";
+import { loadState, saveState, stateExists, withLock } from "../lib/state.mjs";
 
 export async function runDoctor({ project }) {
   let codex = null;
@@ -1876,11 +1996,14 @@ export async function runDoctor({ project }) {
   const started = stateExists(project);
   let versionChanged = null;
   if (started && codex?.version) {
-    const state = loadState(project);
-    if (state.codexVersion && state.codexVersion !== codex.version) versionChanged = { from: state.codexVersion, to: codex.version };
-    state.codexVersion = codex.version;
-    state.rateLimits = rateLimits;
-    saveState(project, state);
+    // Load-modify-save under the same lock every other writer uses.
+    await withLock(project, async () => {
+      const state = loadState(project);
+      if (state.codexVersion && state.codexVersion !== codex.version) versionChanged = { from: state.codexVersion, to: codex.version };
+      state.codexVersion = codex.version;
+      state.rateLimits = rateLimits;
+      saveState(project, state);
+    });
   }
   const hints = [];
   if (!codex) hints.push("Install Codex: npm install -g @openai/codex (or set TANDEM_CODEX_BIN).");
@@ -2084,15 +2207,16 @@ export async function runStart({ project, options }) {
   const summaryFile = requireAbsolute(options["summary-file"], "--summary-file");
   const effort = normalizeEffort(options.effort ?? "medium");
   const timeoutMs = minutes(options["deadline-min"] ?? 8);
-  if (stateExists(project) && loadState(project).threadId && !options.force) {
-    throw new TandemError(
-      "already_started",
-      "tandem is already started in this project.",
-      "Use `contact --kind resume` to continue, `rotate --seed-file <abs>` for a new thread, or `start --force` to reset."
-    );
-  }
   const layout = ensureLayout(project);
   return withLock(project, async () => {
+    // Checked under the lock so two concurrent starts cannot both pass.
+    if (stateExists(project) && loadState(project).threadId && !options.force) {
+      throw new TandemError(
+        "already_started",
+        "tandem is already started in this project.",
+        "Use `contact --kind resume` to continue, `rotate --seed-file <abs>` for a new thread, or `start --force` to reset."
+      );
+    }
     const state = defaultState(project);
     if (stateExists(project) && options.force) {
       const previous = loadState(project);
@@ -2164,7 +2288,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: Task 3, 4, 5, 6, 7, 8.
-- Produces (exchange.mjs): `guardActive(state, options)` (wirft `not_started` / `stopped` / `paused`, `--force` überspringt paused/stopped), `noteFailure(state, result)` (quota → paused), `runWithSchema({ state, project, layout, base, promptFile, schema, effort, deadlineMs, outFile, kind, options }) → { result, parsed, errors, attempts }` (Wächter, Resume-Aufruf, Schema-Prüfung, genau ein Retry; speichert Zustand bei Fehlern und wirft `failureToError`).
+- Produces (exchange.mjs): `guardActive(state, options)` (wirft `not_started` / `stopped` / `paused`, `--force` überspringt paused/stopped), `noteFailure(state, result)` (quota → paused), `recordFailedContact(state, { n, contactId, kind, outFile, effort, result })` (zählt den Kontakt trotz Fehler mit `status = <failure>`), `runWithSchema({ state, project, layout, base, n, contactId, promptFile, schema, effort, deadlineMs, outFile, kind, options }) → { result, parsed, errors, attempts }` (Wächter **vor jedem** Versuch, Resume-Aufruf, Schema-Prüfung, genau ein Retry; bei Fehlern Kontakt verbuchen, Zustand speichern, `failureToError` werfen).
 - Produces (contact): `contact --kind checkpoint|resume|final|sparring --prompt-file <abs> [--effort] [--deadline-min] [--min-remaining] [--force]` → `{ contactId, kind, verdict, replyPath, durationMs, usage, attempts, rateLimits }`. `sparring` ist in Plan A **nicht** freigeschaltet (Schema fehlt) und liefert `bad_kind` mit Hinweis auf Plan B.
 
 - [ ] **Step 1: Failing Test schreiben** (`tests/contact.test.mjs`)
@@ -2233,12 +2357,34 @@ test("thread_lost and rate-limit guard are reported before or after the call", (
   assert.equal(runTandem(["contact", "--kind", "final", "--prompt-file", prompt, "--min-remaining", "0"], { cwd: dir, env: { FAKE_USED_PRIMARY: "95" } }).json.ok, true);
 });
 
-test("resume contact resets session usage; unknown kind rejected", () => {
+test("resume contact starts a new session that includes itself; unknown kind rejected", () => {
   const { dir, prompt } = prepared("resume");
   runTandem(["contact", "--kind", "checkpoint", "--prompt-file", prompt], { cwd: dir });
   const resumed = runTandem(["contact", "--kind", "resume", "--prompt-file", prompt], { cwd: dir });
-  assert.equal(resumed.json.usage.runs, 0);
+  assert.equal(resumed.json.usage.runs, 1);
+  assert.equal(resumed.json.usage.total, 120);
   assert.equal(runTandem(["contact", "--kind", "sparring", "--prompt-file", prompt], { cwd: dir }).json.error, "bad_kind");
+});
+
+test("a failed contact still consumes its id and records the failure status", () => {
+  const { dir, prompt } = prepared("failed");
+  const failed = runTandem(["contact", "--kind", "checkpoint", "--prompt-file", prompt], { cwd: dir, env: { FAKE_CODEX_MODE: "fail" } });
+  assert.equal(failed.json.error, "codex_failed");
+  const state = JSON.parse(fs.readFileSync(path.join(dir, ".tandem", "state.json"), "utf8"));
+  assert.equal(state.contacts, 1);
+  assert.equal(state.lastContact.id, "C1");
+  assert.equal(state.lastContact.status, "codex_failed");
+  const next = runTandem(["contact", "--kind", "checkpoint", "--prompt-file", prompt], { cwd: dir });
+  assert.equal(next.json.contactId, "C2");
+});
+
+test("the schema retry re-checks the budget before the second model call", () => {
+  const { dir, prompt, logFile } = prepared("retrybudget");
+  // First attempt passes the guard; the fake returns invalid JSON; the retry must consult the guard again.
+  const result = runTandem(["contact", "--kind", "checkpoint", "--prompt-file", prompt], { cwd: dir, env: { FAKE_CODEX_MODE: "invalid_json", FAKE_CODEX_LOG: logFile } });
+  assert.equal(result.json.error, "invalid_output");
+  const appServerCalls = readLog(logFile).filter((c) => c.argv[0] === "app-server").length;
+  assert.equal(appServerCalls, 2);
 });
 ```
 
@@ -2269,13 +2415,16 @@ export function noteFailure(state, result) {
   if (result.failure === "quota") state.paused = true;
 }
 
-export async function runWithSchema({ state, project, layout, base, promptFile, schema, effort, deadlineMs, outFile, kind, options = {} }) {
-  try {
-    await ensureBudget(state, { minRemaining: minRemainingOf(options) });
-  } catch (error) {
-    saveState(project, state);
-    throw error;
-  }
+// A failed contact still consumes its number so the next attempt gets a fresh id and fresh files.
+export function recordFailedContact(state, { n, contactId, kind, outFile, effort, result }) {
+  state.contacts = n;
+  state.lastContact = {
+    id: contactId, kind, at: new Date().toISOString(), status: result.failure, replyPath: outFile,
+    durationMs: result.durationMs, effort
+  };
+}
+
+export async function runWithSchema({ state, project, layout, base, n, contactId, promptFile, schema, effort, deadlineMs, outFile, kind, options = {} }) {
   const args = buildResumeArgs({ threadId: state.threadId, effort, schemaPath: schemaPath(schema), outFile });
   let attempts = 0;
   let result = null;
@@ -2284,6 +2433,12 @@ export async function runWithSchema({ state, project, layout, base, promptFile, 
   let currentPrompt = promptFile;
   while (attempts < 2) {
     attempts += 1;
+    try {
+      await ensureBudget(state, { minRemaining: minRemainingOf(options) }); // before EVERY model call, retry included
+    } catch (error) {
+      saveState(project, state);
+      throw error;
+    }
     result = await runCodex({
       args,
       promptFile: currentPrompt,
@@ -2294,6 +2449,7 @@ export async function runWithSchema({ state, project, layout, base, promptFile, 
     addUsage(state, kind, extractUsage(result));
     if (result.failure) {
       noteFailure(state, result);
+      recordFailedContact(state, { n, contactId, kind, outFile, effort, result });
       saveState(project, state);
       throw failureToError(result, kind);
     }
@@ -2353,12 +2509,12 @@ export async function runContact({ project, options }) {
     const wrapped = path.join(layout.prompts, `${base}.md`);
     fs.writeFileSync(wrapped, renderTemplate("contact", { CONTACT_ID: contactId, KIND: kind, BODY: body, SCHEMA: spec.schema, CAP: CAPS[spec.schema] }), "utf8");
     const outFile = path.join(layout.replies, `${base}.json`);
+    if (kind === "resume") state.usage.session = emptyUsage(); // new session starts WITH this contact
     const { result, parsed, errors, attempts } = await runWithSchema({
-      state, project, layout, base, promptFile: wrapped, schema: spec.schema, effort, deadlineMs, outFile, kind, options
+      state, project, layout, base, n, contactId, promptFile: wrapped, schema: spec.schema, effort, deadlineMs, outFile, kind, options
     });
     state.contacts = n;
     state.lastContact = { id: contactId, kind, at: new Date().toISOString(), status: parsed ? "ok" : "invalid_output", replyPath: outFile, durationMs: result.durationMs, effort };
-    if (kind === "resume") state.usage.session = emptyUsage();
     saveState(project, state);
     if (!parsed) {
       throw new TandemError(
@@ -2410,7 +2566,7 @@ export async function runControl({ command, project, positionals, options }) {
 - [ ] **Step 6: Test laufen lassen, Erfolg prüfen**
 
 Run: `node --test tests/contact.test.mjs`
-Expected: `# pass 5`, `# fail 0`.
+Expected: `# pass 7`, `# fail 0`.
 
 - [ ] **Step 7: Commit**
 
@@ -2489,6 +2645,27 @@ test("round order is enforced and round 4 is rejected", () => {
   assert.equal(runTandem(["plan-round", "--round", "2", "--plan-file", plan, "--matrix-file", matrix], { cwd: dir }).json.error, "round_order");
   assert.equal(runTandem(["plan-round", "--round", "4", "--plan-file", plan, "--matrix-file", matrix], { cwd: dir }).json.error, "bad_round");
 });
+
+test("a plan written directly to .tandem/plans/plan-r1.md is accepted (no self-copy)", () => {
+  const { dir } = prepared("plan-self");
+  const inPlace = writeFile(dir, path.join(".tandem", "plans", "plan-r1.md"), "# Plan in place");
+  const { json } = runTandem(["plan-round", "--round", "1", "--plan-file", inPlace], { cwd: dir });
+  assert.equal(json.ok, true);
+  assert.equal(fs.readFileSync(inPlace, "utf8"), "# Plan in place");
+});
+
+test("APPROVE without a named residual risk is not consensus; a failed round keeps the previous plan state", () => {
+  const { dir, plan } = prepared("plan-risk");
+  const noRisk = runTandem(["plan-round", "--round", "1", "--plan-file", plan], { cwd: dir, env: { FAKE_PLAN_RISK: "  " } });
+  assert.equal(noRisk.json.verdict.verdict, "APPROVE");
+  assert.equal(noRisk.json.consensus, false);
+  const before = JSON.parse(fs.readFileSync(path.join(dir, ".tandem", "state.json"), "utf8")).plan;
+  assert.equal(before.round, 1);
+  const failed = runTandem(["plan-round", "--round", "1", "--plan-file", plan], { cwd: dir, env: { FAKE_CODEX_MODE: "fail" } });
+  assert.equal(failed.json.error, "codex_failed");
+  const after = JSON.parse(fs.readFileSync(path.join(dir, ".tandem", "state.json"), "utf8")).plan;
+  assert.deepEqual(after, before);
+});
 ```
 
 - [ ] **Step 2: Test laufen lassen, Fehlschlag prüfen**
@@ -2505,7 +2682,7 @@ import path from "node:path";
 import { minutes, normalizeEffort } from "../lib/codex.mjs";
 import { guardActive, runWithSchema } from "../lib/exchange.mjs";
 import { TandemError } from "../lib/output.mjs";
-import { ensureLayout, requireAbsolute, stamp } from "../lib/paths.mjs";
+import { canonical, ensureLayout, requireAbsolute, stamp } from "../lib/paths.mjs";
 import { renderTemplate } from "../lib/prompts.mjs";
 import { loadState, saveState, withLock } from "../lib/state.mjs";
 
@@ -2515,8 +2692,15 @@ export function isConsensus(verdict) {
     verdict.criteria.blockersOpen === 0 &&
     verdict.criteria.sourcesRead === true &&
     verdict.criteria.testStrategyFeasible === true &&
+    String(verdict.criteria.residualRisk ?? "").trim().length > 0 &&
     !verdict.points.some((p) => p.severity === "BLOCKER" || p.severity === "MAJOR")
   );
+}
+
+// Copies a plan/matrix file into .tandem/plans unless it already IS that file (self-copy fails on Windows).
+function archiveInto(sourceFile, targetFile) {
+  if (canonical(sourceFile) === canonical(targetFile)) return;
+  fs.copyFileSync(sourceFile, targetFile);
 }
 
 export async function runPlanRound({ project, options }) {
@@ -2534,18 +2718,18 @@ export async function runPlanRound({ project, options }) {
   return withLock(project, async () => {
     const state = loadState(project);
     guardActive(state, options);
-    if (round === 1) {
-      state.plan = { hash: null, round: 0, planFile: null, verdicts: [] };
-    } else if (state.plan.round !== round - 1) {
+    if (round > 1 && state.plan.round !== round - 1) {
       throw new TandemError("round_order", `Expected round ${state.plan.round + 1}, got ${round}.`, "Rounds run 1 → 2 → 3. Start a new plan with --round 1.");
     }
+    // The plan state is only replaced after a successful verdict; a failed or invalid round leaves the last good state.
+    const nextPlan = round === 1 ? { hash: null, round: 0, planFile: null, verdicts: [] } : structuredClone(state.plan);
     const layout = ensureLayout(project);
     const plan = fs.readFileSync(planFile, "utf8");
     const hash = crypto.createHash("sha256").update(plan).digest("hex").slice(0, 12);
-    fs.copyFileSync(planFile, path.join(layout.plans, `plan-r${round}.md`));
+    archiveInto(planFile, path.join(layout.plans, `plan-r${round}.md`));
     let matrixBlock = "";
     if (matrixFile) {
-      fs.copyFileSync(matrixFile, path.join(layout.plans, `matrix-r${round}.md`));
+      archiveInto(matrixFile, path.join(layout.plans, `matrix-r${round}.md`));
       matrixBlock = renderTemplate("plan-matrix", { PREVIOUS: String(round - 1), MATRIX: fs.readFileSync(matrixFile, "utf8") });
     }
     const n = state.contacts + 1;
@@ -2555,15 +2739,16 @@ export async function runPlanRound({ project, options }) {
     fs.writeFileSync(wrapped, renderTemplate("plan-round", { ROUND: String(round), PLAN_HASH: hash, PLAN: plan, MATRIX_BLOCK: matrixBlock }), "utf8");
     const outFile = path.join(layout.replies, `${base}.json`);
     const { result, parsed, errors, attempts } = await runWithSchema({
-      state, project, layout, base, promptFile: wrapped, schema: "plan-verdict", effort, deadlineMs, outFile, kind: "plan", options
+      state, project, layout, base, n, contactId, promptFile: wrapped, schema: "plan-verdict", effort, deadlineMs, outFile, kind: "plan", options
     });
     state.contacts = n;
     state.lastContact = { id: contactId, kind: `plan-r${round}`, at: new Date().toISOString(), status: parsed ? "ok" : "invalid_output", replyPath: outFile, durationMs: result.durationMs, effort };
-    state.plan.hash = hash;
-    state.plan.round = round;
-    state.plan.planFile = planFile;
     if (parsed) {
-      state.plan.verdicts.push({ round, hash, verdict: parsed.verdict, consensus: isConsensus(parsed), blockersOpen: parsed.criteria.blockersOpen, points: parsed.points.length, replyPath: outFile });
+      nextPlan.hash = hash;
+      nextPlan.round = round;
+      nextPlan.planFile = planFile;
+      nextPlan.verdicts.push({ round, hash, verdict: parsed.verdict, consensus: isConsensus(parsed), blockersOpen: parsed.criteria.blockersOpen, points: parsed.points.length, replyPath: outFile });
+      state.plan = nextPlan;
     }
     saveState(project, state);
     if (!parsed) {
@@ -2580,7 +2765,7 @@ export async function runPlanRound({ project, options }) {
 - [ ] **Step 4: Test laufen lassen, Erfolg prüfen**
 
 Run: `node --test tests/plan-round.test.mjs`
-Expected: `# pass 3`, `# fail 0`.
+Expected: `# pass 5`, `# fail 0`.
 
 - [ ] **Step 5: Commit**
 
@@ -2676,7 +2861,7 @@ Expected: FAIL mit `not_implemented`.
 import fs from "node:fs";
 import path from "node:path";
 import { failureToError, minutes, normalizeEffort, runCodex } from "../lib/codex.mjs";
-import { noteFailure } from "../lib/exchange.mjs";
+import { noteFailure, recordFailedContact } from "../lib/exchange.mjs";
 import { TandemError } from "../lib/output.mjs";
 import { ensureLayout, stamp } from "../lib/paths.mjs";
 import { ensureBudget, minRemainingOf } from "../lib/ratelimits.mjs";
@@ -2714,6 +2899,7 @@ export async function runReview({ project, options }) {
     addUsage(state, "review", extractUsage(result));
     if (result.failure) {
       noteFailure(state, result);
+      recordFailedContact(state, { n, contactId, kind: "review", outFile, effort, result });
       saveState(project, state);
       throw failureToError(result, "review");
     }
@@ -2844,6 +3030,7 @@ Expected: FAIL mit `not_implemented`.
 import fs from "node:fs";
 import path from "node:path";
 import { buildStartArgs, failureToError, minutes, normalizeEffort, readLastMessage, runCodex, threadIdFromEvents } from "../lib/codex.mjs";
+import { recordFailedContact } from "../lib/exchange.mjs";
 import { TandemError } from "../lib/output.mjs";
 import { ensureLayout, requireAbsolute, stamp } from "../lib/paths.mjs";
 import { renderTemplate } from "../lib/prompts.mjs";
@@ -2876,6 +3063,7 @@ export async function runRotate({ project, options }) {
     const result = await runCodex({ args: buildStartArgs({ project, effort, outFile }), promptFile, cwd: project, timeoutMs, logFile: path.join(layout.replies, `${base}.log`) });
     addUsage(state, "rotate", extractUsage(result));
     if (result.failure) {
+      recordFailedContact(state, { n, contactId: `C${n}`, kind: "rotate", outFile, effort, result });
       saveState(project, state);
       throw failureToError(result, "rotate");
     }
@@ -2993,7 +3181,7 @@ Bei `error: quota_low` **keinen** Aufruf erzwingen: Nutzer informieren (Fenster,
 Eigener Planungsfluss; die Nutzer-Freigabe des Plans übernimmt der Konsens (Entscheidung des Nutzers). Rückfragen an den Nutzer sind vorher erlaubt (eine Frage pro Nachricht).
 
 1. **Kontext klären:** Ziel, Nicht-Ziele, Constraints, Akzeptanztests, Alternativen, Rollback, Pfadliste.
-2. **Plan schreiben** im `writing-plans`-Format nach `.tandem/plans/plan-r1.md` (absolut). Irreversible Schritte (Deploy, Löschen von Nutzerdaten, Zahlungen, Nachrichten nach außen, Produktionskonfiguration) im Plan **markieren**.
+2. **Plan schreiben** im `writing-plans`-Format, z. B. nach `.tandem/plans/plan-r1.md` (absolut; der Runner archiviert Kopien unter genau diesem Namen und erkennt, wenn Quelle und Ziel dieselbe Datei sind). Irreversible Schritte (Deploy, Löschen von Nutzerdaten, Zahlungen, Nachrichten nach außen, Produktionskonfiguration) im Plan **markieren**.
 3. **Runde 1:** `plan-round --round 1 --plan-file <abs>` (Effort high). Antwort `verdict` (`APPROVE|REVISE`), `criteria`, `points`, und vom Runner berechnet: `consensus`.
 4. **Runden 2–3:** jeden Punkt annehmen/ablehnen/zurückstellen, Plan überarbeiten, Matrix-Datei schreiben (`- P1-1 → accepted: <Grund>`, `rejected`, `deferred`), dann `plan-round --round 2 --plan-file <abs> --matrix-file <abs>`.
 5. **`consensus: true` → Automode:** sofort umsetzen (`superpowers:executing-plans` oder `subagent-driven-development`), nach jeder Aufgabe ein Begleiter-Checkpoint, am Ende der Abschluss. Markierte irreversible Schritte bekommen **immer** einen Stopp beim Nutzer.
@@ -3110,6 +3298,10 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
 
 ---
+
+## Codex-Review des Plans (Duofold, 2026-09-06) — eingearbeitet
+
+Zehn Punkte, alle übernommen: atomarer Lock mit `wx` und Besitzer-Token (Task 3); Selbstkopie-Erkennung für Planartefakte und Planstand erst nach erfolgreichem Verdict (Task 12); Nutzungs-Wächter vor **jedem** Modellaufruf inkl. Schema-Retry (Task 11); garantierte Promise-Auflösung nach fehlgeschlagenem Kill und synchroner Kill im Wächter (Tasks 6, 7); Validierung von `--min-remaining` (Task 7); fehlgeschlagene Kontakte zählen mit Status (Tasks 11, 13, 14); `doctor` unter Lock (Task 9); Session-Reset vor dem Resume-Lauf (Task 11); Punkte-Caps im Validator und Restrisiko-Pflicht im Konsens (Tasks 4, 12); Fake-Fehlerpfade für den Wächter (Tasks 6, 7).
 
 ## Abnahme von Plan A (nach Task 15)
 

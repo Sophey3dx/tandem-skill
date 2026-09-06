@@ -12,6 +12,8 @@ import { runReview } from "./commands/review.mjs";
 import { runStatus } from "./commands/status.mjs";
 import { runControl } from "./commands/control.mjs";
 import { runRotate } from "./commands/rotate.mjs";
+import { runWorker } from "./commands/worker.mjs";
+import { runLane } from "./commands/lane.mjs";
 
 const FLAGS = ["human", "force", "uncommitted", "json"];
 
@@ -27,7 +29,9 @@ export const COMMANDS = {
   unpause: runControl,
   stop: runControl,
   config: runControl,
-  rotate: runRotate
+  rotate: runRotate,
+  worker: runWorker,
+  lane: runLane
 };
 
 export async function main(argv) {

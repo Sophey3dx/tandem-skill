@@ -3,7 +3,7 @@ import path from "node:path";
 import { TandemError } from "./output.mjs";
 import { SCHEMAS_DIR } from "./paths.mjs";
 
-export const SCHEMA_NAMES = ["verdict", "plan-verdict"];
+export const SCHEMA_NAMES = ["verdict", "plan-verdict", "worker-result", "sparring"];
 
 export function schemaPath(name) {
   if (!SCHEMA_NAMES.includes(name)) {
@@ -96,6 +96,20 @@ export function semanticErrors(schemaName, value, { idPrefix, round } = {}) {
         }
       });
     }
+  }
+  if (schemaName === "sparring") {
+    if (!String(value?.position ?? "").trim()) errors.push("$.position: must not be empty");
+    if (!String(value?.recommendation ?? "").trim()) errors.push("$.recommendation: must not be empty");
+    for (const key of ["reasons", "risks"]) {
+      if (Array.isArray(value?.[key]) && value[key].length > 8) errors.push(`$.${key}: more than 8 items`);
+    }
+  }
+  if (schemaName === "worker-result") {
+    const remaining = Array.isArray(value?.remaining) ? value.remaining : [];
+    const blockers = Array.isArray(value?.blockers) ? value.blockers : [];
+    if (value?.status === "DONE" && (remaining.length > 0 || blockers.length > 0)) errors.push("$.status: DONE contradicts remaining work or blockers");
+    if (value?.status === "BLOCKED" && blockers.length === 0) errors.push("$.status: BLOCKED requires at least one blocker with evidence");
+    if (value?.status === "PARTIAL" && remaining.length === 0) errors.push("$.status: PARTIAL requires remaining work");
   }
   return errors;
 }

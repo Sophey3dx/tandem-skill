@@ -88,6 +88,23 @@ test("parseReplyFile applies semantic checks after the structural ones", () => {
   assert.ok(result.errors.some((e) => e.includes("MAJOR points contradict verdict OK")));
 });
 
+test("sparring and worker-result semantics", () => {
+  const good = { position: "p", reasons: ["a"], checked: [], risks: [], recommendation: "r" };
+  assert.deepEqual(validate(loadSchema("sparring"), good), []);
+  assert.deepEqual(semanticErrors("sparring", good), []);
+  assert.ok(semanticErrors("sparring", { ...good, position: " " }).some((e) => e.includes("$.position")));
+  assert.ok(semanticErrors("sparring", { ...good, recommendation: "" }).some((e) => e.includes("$.recommendation")));
+  assert.ok(semanticErrors("sparring", { ...good, reasons: Array(9).fill("x") }).some((e) => e.includes("$.reasons: more than 8")));
+  const done = { status: "DONE", touchedFiles: ["a.js"], tests: [{ cmd: "node --test", exitCode: 0 }], remaining: [], blockers: [], notes: "" };
+  assert.deepEqual(validate(loadSchema("worker-result"), done), []);
+  assert.deepEqual(semanticErrors("worker-result", done), []);
+  assert.ok(semanticErrors("worker-result", { ...done, remaining: ["x"] }).some((e) => e.includes("DONE contradicts")));
+  assert.ok(semanticErrors("worker-result", { ...done, status: "BLOCKED" }).some((e) => e.includes("BLOCKED requires")));
+  assert.ok(semanticErrors("worker-result", { ...done, status: "PARTIAL" }).some((e) => e.includes("PARTIAL requires")));
+  assert.deepEqual(semanticErrors("worker-result", { ...done, status: "BLOCKED", blockers: [{ text: "t", evidence: "e" }] }), []);
+  assert.equal(schemaPath("worker-result").endsWith("worker-result.schema.json"), true);
+});
+
 test("parseReplyFile enforces the point caps (5 for verdict, 8 for plan-verdict)", () => {
   const tmp = path.join(HERE, ".tmp");
   fs.mkdirSync(tmp, { recursive: true });

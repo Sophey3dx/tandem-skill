@@ -1,0 +1,12 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["position", "reasons", "checked", "risks", "recommendation"],
+  "properties": {
+    "position": { "type": "string" },
+    "reasons": { "type": "array", "items": { "type": "string" } },
+    "checked": { "type": "array", "items": { "type": "string" } },
+    "risks": { "type": "array", "items": { "type": "string" } },
+    "recommendation": { "type": "string" }
+  }
+}

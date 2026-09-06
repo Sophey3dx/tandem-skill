@@ -1,0 +1,29 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status", "touchedFiles", "tests", "remaining", "blockers", "notes"],
+  "properties": {
+    "status": { "type": "string", "enum": ["DONE", "PARTIAL", "BLOCKED"] },
+    "touchedFiles": { "type": "array", "items": { "type": "string" } },
+    "tests": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["cmd", "exitCode"],
+        "properties": { "cmd": { "type": "string" }, "exitCode": { "type": "integer" } }
+      }
+    },
+    "remaining": { "type": "array", "items": { "type": "string" } },
+    "blockers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["text", "evidence"],
+        "properties": { "text": { "type": "string" }, "evidence": { "type": "string" } }
+      }
+    },
+    "notes": { "type": "string" }
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "checked", "criteria", "points"],
+  "properties": {
+    "verdict": { "type": "string", "enum": ["APPROVE", "REVISE"] },
+    "checked": { "type": "array", "items": { "type": "string" } },
+    "criteria": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["blockersOpen", "sourcesRead", "testStrategyFeasible", "residualRisk"],
+      "properties": {
+        "blockersOpen": { "type": "integer" },
+        "sourcesRead": { "type": "boolean" },
+        "testStrategyFeasible": { "type": "boolean" },
+        "residualRisk": { "type": "string" }
+      }
+    },
+    "points": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "severity", "category", "text", "section", "newEvidence"],
+        "properties": {
+          "id": { "type": "string" },
+          "severity": { "type": "string", "enum": ["BLOCKER", "MAJOR", "MINOR"] },
+          "category": { "type": "string", "enum": ["correctness", "security", "scope", "testability"] },
+          "text": { "type": "string" },
+          "section": { "type": ["string", "null"] },
+          "newEvidence": { "type": ["string", "null"] }
+        }
+      }
+    }
+  }
+}

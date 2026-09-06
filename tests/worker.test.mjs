@@ -530,3 +530,57 @@ test("giving a reserved record up claims the marker, so a late launcher can neve
   assert.equal(adopted.json.workers[0].pid, process.pid);
   assert.equal(adopted.json.workers[0].identityUnknown, true);
 });
+
+test("without OS confinement workers refuse to start unless the user opts in explicitly", () => {
+  const { dir, zone, brief } = prepared("worker-unconfined");
+  const refused = runTandem(["worker", "start", "--zone", zone, "--brief-file", brief], { cwd: dir, env: { TANDEM_TEST_CONFINEMENT: "none" } });
+  assert.equal(refused.json.error, "unconfined_platform");
+  assert.match(refused.json.hint, /TANDEM_ALLOW_UNCONFINED_WORKERS/);
+  assert.equal(runTandem(["worker", "status"], { cwd: dir }).json.workers.length, 0, "nothing was reserved");
+  const allowed = runTandem(["worker", "start", "--zone", zone, "--brief-file", brief], { cwd: dir, env: { TANDEM_TEST_CONFINEMENT: "none", TANDEM_ALLOW_UNCONFINED_WORKERS: "1" } });
+  assert.equal(allowed.json.ok, true, JSON.stringify(allowed.json));
+  assert.equal(allowed.json.worker.confinement, "none");
+  const waited = runTandem(["worker", "wait", "W1", "--poll-sec", "1"], { cwd: dir, env: { TANDEM_TEST_CONFINEMENT: "none", TANDEM_ALLOW_UNCONFINED_WORKERS: "1" } });
+  assert.equal(waited.json.worker.status, "done", JSON.stringify(waited.json));
+  const marker = JSON.parse(fs.readFileSync(path.join(dir, ".tandem", "workers", "W1", "launched.json"), "utf8"));
+  assert.equal(marker.confinement, "none");
+  assert.equal(marker.job, false);
+});
+
+test("an unclear marker keeps a given-up record reserved until it can be read; a directory in its place is safe to abandon", () => {
+  const { dir, zone, brief } = prepared("worker-unresolved");
+  const w1dir = path.join(dir, ".tandem", "workers", "W1");
+  fs.mkdirSync(w1dir, { recursive: true });
+  const record = {
+    id: "W1", zone: fs.realpathSync.native(zone), pid: null, procStart: null, identityPending: true, effort: "low", model: null, status: "starting",
+    startedAt: new Date(Date.now() - 60 * 1000).toISOString(), deadlineAt: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+    briefPath: path.join(w1dir, "brief.md"), resultPath: path.join(w1dir, "result.json"), logPath: path.join(w1dir, "log.txt"), usageBooked: false
+  };
+  fs.writeFileSync(path.join(w1dir, "launched.json"), "", "utf8"); // a launcher is writing its marker right now
+  let state = stateOf(dir);
+  state.workerSeq = 1;
+  state.workers.push(record);
+  fs.writeFileSync(path.join(dir, ".tandem", "state.json"), JSON.stringify(state, null, 2));
+  const unclear = runTandem(["worker", "status", "W1"], { cwd: dir });
+  assert.equal(unclear.json.workers[0].status, "starting", JSON.stringify(unclear.json));
+  assert.equal(unclear.json.workers[0].launchUnresolved, true);
+  assert.equal(unclear.json.active, 1, "the zone stays reserved");
+  assert.equal(runTandem(["worker", "start", "--zone", zone, "--brief-file", brief], { cwd: dir }).json.error, "bad_zone");
+  fs.writeFileSync(path.join(w1dir, "launched.json"), JSON.stringify({ pid: process.pid, at: new Date().toISOString() }), "utf8"); // the write completed
+  const adopted = runTandem(["worker", "status", "W1"], { cwd: dir });
+  assert.equal(adopted.json.workers[0].status, "running", JSON.stringify(adopted.json));
+  assert.equal(adopted.json.workers[0].pid, process.pid);
+  assert.equal(adopted.json.workers[0].launchUnresolved, undefined);
+  // A directory where the marker belongs: no launcher can ever claim it, so giving up is safe.
+  const zone2 = path.join(dir, "zone2");
+  fs.mkdirSync(zone2);
+  const w2dir = path.join(dir, ".tandem", "workers", "W2");
+  fs.mkdirSync(path.join(w2dir, "launched.json"), { recursive: true });
+  state = stateOf(dir);
+  state.workerSeq = 2;
+  state.workers.push({ ...record, id: "W2", zone: fs.realpathSync.native(zone2), briefPath: path.join(w2dir, "brief.md"), resultPath: path.join(w2dir, "result.json"), logPath: path.join(w2dir, "log.txt") });
+  fs.writeFileSync(path.join(dir, ".tandem", "state.json"), JSON.stringify(state, null, 2));
+  const lost = runTandem(["worker", "status", "W2"], { cwd: dir });
+  assert.equal(lost.json.workers[0].status, "failed", JSON.stringify(lost.json));
+  assert.equal(lost.json.workers[0].failure, "spawn_lost");
+});

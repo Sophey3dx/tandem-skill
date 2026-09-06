@@ -10,11 +10,12 @@
 //   If the file cannot be created, nothing is started (exit 65): either the marker is unwritable, or the
 //   runner already gave the record up and left an "abandoned" marker under the same name, so a late launcher
 //   must not start codex into a zone that is free again.
-// - Descendants do not outlive the worker: on Windows codex runs inside a Job Object with kill-on-close
-//   (win-job-run.ps1), which covers every descendant however detached. On POSIX the launcher kills every
-//   process whose parent chain still leads to it and then its own process group (the runner spawns it as a
-//   group leader and sets TANDEM_LAUNCH_GROUP=1); a descendant that started its own session (setsid) is not
-//   covered there, which the documentation states.
+// - Descendants do not outlive the worker. TANDEM_CONFINEMENT (set by the runner from lib/confinement.mjs):
+//   "job" runs codex inside a Windows Job Object with kill-on-close (win-job-run.ps1), "systemd-scope" runs
+//   it inside a transient systemd user scope that is killed as a whole when codex ends, "none" means the
+//   runner allowed an unconfined start explicitly (TANDEM_ALLOW_UNCONFINED_WORKERS=1). On POSIX the launcher
+//   additionally kills every process whose parent chain still leads to it and then its own process group
+//   (the runner spawns it as a group leader and sets TANDEM_LAUNCH_GROUP=1).
 // Usage: node worker-launch.mjs <absolute logFile> <cmd> [args...]
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
@@ -28,6 +29,8 @@ if (!logFile || !cmd) {
   process.exit(64);
 }
 const markerFile = path.join(path.dirname(logFile), "launched.json");
+const confinement = process.env.TANDEM_CONFINEMENT ?? (process.platform === "win32" ? "job" : "none");
+const scopeUnit = confinement === "systemd-scope" ? `tandem-worker-${process.pid}` : null;
 
 function record(entry) {
   try {
@@ -40,13 +43,21 @@ function record(entry) {
 
 // Fail-closed and exclusive: the first write creates the marker ("wx"); later writes update our own file.
 function mark(extra = {}, { exclusive = false } = {}) {
-  fs.writeFileSync(markerFile, `${JSON.stringify({ pid: process.pid, at: new Date().toISOString(), ...extra })}\n`, { encoding: "utf8", flag: exclusive ? "wx" : "w" });
+  fs.writeFileSync(markerFile, `${JSON.stringify({ pid: process.pid, at: new Date().toISOString(), confinement, ...extra })}\n`, { encoding: "utf8", flag: exclusive ? "wx" : "w" });
 }
 
-// POSIX: kill every process whose parent chain still leads to us, then the whole process group (which also
-// covers children reparented to init while their parent lived in our group). Windows: the Job Object did it.
+// POSIX: kill the systemd scope (if any), then every process whose parent chain still leads to us, then the
+// whole process group (which also covers children reparented to init while their parent lived in our
+// group). Windows: the Job Object did it.
 function reapDescendants() {
   if (process.platform === "win32") return;
+  if (scopeUnit) {
+    try {
+      spawnSync("systemctl", ["--user", "kill", "--signal=SIGKILL", `${scopeUnit}.scope`], { stdio: "ignore", timeout: 10000 });
+    } catch {
+      // the scope is already gone
+    }
+  }
   try {
     const listing = spawnSync("ps", ["-eo", "pid=,ppid="], { encoding: "utf8" }).stdout ?? "";
     const childrenOf = new Map();
@@ -108,12 +119,11 @@ try {
   process.exit(65);
 }
 
-// The job wrapper gets the command line as a JSON file (PowerShell's own argument parser rejects a bare "-"
-// and reinterprets others); the file also documents exactly what was started.
-const useJob = process.platform === "win32" && process.env.TANDEM_TEST_NO_JOB !== "1";
 let spawnCmd = cmd;
 let spawnArgs = args;
-if (useJob) {
+if (confinement === "job") {
+  // The job wrapper gets the command line as a JSON file (PowerShell's own argument parser rejects a bare
+  // "-" and reinterprets others); the file also documents exactly what was started.
   const cmdFile = path.join(path.dirname(logFile), "launch-cmd.json");
   try {
     fs.writeFileSync(cmdFile, JSON.stringify([cmd, ...args]), "utf8");
@@ -122,6 +132,10 @@ if (useJob) {
   }
   spawnCmd = "powershell.exe";
   spawnArgs = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", JOB_SCRIPT, cmdFile];
+} else if (confinement === "systemd-scope") {
+  // systemd-run passes everything after "--" verbatim; the scope is a cgroup no descendant can leave.
+  spawnCmd = "systemd-run";
+  spawnArgs = ["--user", "--scope", "--quiet", "--collect", `--unit=${scopeUnit}`, "--", cmd, ...args];
 }
 let child;
 try {
@@ -130,7 +144,7 @@ try {
   leave({ code: 127, signal: null, error: error.message }, 127);
 }
 try {
-  mark({ childPid: child.pid ?? null, job: useJob });
+  mark({ childPid: child.pid ?? null, job: confinement === "job", scopeUnit });
 } catch {
   // the exclusive marker is in place; the child pid is a convenience
 }
@@ -144,7 +158,7 @@ child.on("error", (error) => {
 child.on("exit", (code, signal) => {
   if (reported) return;
   reported = true;
-  if (useJob && code === 66) leave({ code: 66, signal: null, error: "job wrapper failed (see tandem-job-error in the log)" }, 66);
+  if (confinement === "job" && code === 66) leave({ code: 66, signal: null, error: "job wrapper failed (see tandem-job-error in the log)" }, 66);
   else leave({ code, signal }, code ?? 1);
 });
 

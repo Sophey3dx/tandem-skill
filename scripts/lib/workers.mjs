@@ -47,15 +47,15 @@ export function buildWorkerArgs({ zone, effort, outFile, model = null }) {
 // on POSIX the detached process leads its own group). Identity (start time) is captured by the caller.
 // Resolves once the launcher process exists; a start failure (e.g. a cwd that vanished after the zone check)
 // rejects with the spawn error instead of surfacing as an unhandled 'error' event.
-export async function spawnDetachedCodex({ args, stdinFile, logFile, cwd, env = process.env }) {
+export async function spawnDetachedCodex({ args, stdinFile, logFile, cwd, confinement = "none", env = process.env }) {
   const { cmd, prefix } = resolveCodex(env);
   const inFd = fs.openSync(stdinFile, "r");
   const outFd = fs.openSync(logFile, "a");
   let child;
   try {
-    // detached: on POSIX the launcher leads its own process group (TANDEM_LAUNCH_GROUP tells it so); on
-    // Windows it runs codex inside a Job Object. Either way no descendant outlives the worker.
-    child = spawn(process.execPath, [LAUNCHER, logFile, cmd, ...prefix, ...args], { cwd, env: { ...env, TANDEM_LAUNCH_GROUP: "1" }, detached: true, stdio: [inFd, outFd, outFd], windowsHide: true });
+    // detached: on POSIX the launcher leads its own process group (TANDEM_LAUNCH_GROUP tells it so).
+    // TANDEM_CONFINEMENT names the OS mechanism the launcher wraps codex in (lib/confinement.mjs).
+    child = spawn(process.execPath, [LAUNCHER, logFile, cmd, ...prefix, ...args], { cwd, env: { ...env, TANDEM_LAUNCH_GROUP: "1", TANDEM_CONFINEMENT: confinement }, detached: true, stdio: [inFd, outFd, outFd], windowsHide: true });
     await new Promise((resolve, reject) => {
       child.once("spawn", resolve);
       child.once("error", reject);
@@ -115,14 +115,34 @@ export function launchMarker(worker) {
 }
 
 // Gives a reserved record up: creates the marker EXCLUSIVELY with abandoned=true, so a launcher that is only
-// now getting scheduled fails its own exclusive create and never starts codex. Returns false when the
-// launcher won the race (its marker exists): the caller adopts that pid instead.
+// now getting scheduled fails its own exclusive create and never starts codex. Returns
+//   "abandoned"       our marker is in place, or nothing can ever claim the path (a directory sits there, or
+//                     the worker directory is gone): no launcher can start from it
+//   "launcher_found"  a launcher marker with a pid exists: the caller adopts that pid
+//   "unresolved"      the path is taken but not readable as either (a launcher may be writing it right now),
+//                     or the marker could not be written for another reason: keep the record reserved and
+//                     try again on the next refresh
 function abandonLaunch(worker) {
+  const file = markerPath(worker);
   try {
-    fs.writeFileSync(markerPath(worker), `${JSON.stringify({ abandoned: true, at: new Date().toISOString() })}\n`, { encoding: "utf8", flag: "wx" });
-    return true;
+    fs.writeFileSync(file, `${JSON.stringify({ abandoned: true, at: new Date().toISOString() })}\n`, { encoding: "utf8", flag: "wx" });
+    return "abandoned";
   } catch (error) {
-    return error.code !== "EEXIST" || launchMarker(worker) === null; // an existing abandoned marker is ours
+    if (error.code === "ENOENT") return "abandoned"; // the worker directory is gone: the launcher cannot write its marker either
+    if (error.code !== "EEXIST" && error.code !== "EISDIR") return "unresolved";
+    let stat;
+    try {
+      stat = fs.statSync(file);
+    } catch {
+      return "unresolved";
+    }
+    if (stat.isDirectory()) return "abandoned"; // the launcher's exclusive create fails there too (exit 65)
+    if (launchMarker(worker)) return "launcher_found";
+    try {
+      return JSON.parse(fs.readFileSync(file, "utf8")).abandoned === true ? "abandoned" : "unresolved";
+    } catch {
+      return "unresolved"; // empty or partial: the launcher is still writing
+    }
   }
 }
 
@@ -262,9 +282,18 @@ function resolvePid(worker, now) {
   if (marker) return adopt(marker);
   if (now - Date.parse(worker.startedAt) <= STARTING_GRACE_MS) return "pending";
   // Grace over: claim the marker so a late launcher cannot start; if it beat us to it, track it instead.
-  if (abandonLaunch(worker)) return "lost";
-  const late = launchMarker(worker);
-  return late ? adopt(late) : "lost";
+  // Anything unclear keeps the reservation (zone stays blocked) and is re-checked on the next refresh.
+  const claim = abandonLaunch(worker);
+  if (claim === "abandoned") {
+    delete worker.launchUnresolved;
+    return "lost";
+  }
+  if (claim === "launcher_found") {
+    delete worker.launchUnresolved;
+    return adopt(launchMarker(worker));
+  }
+  worker.launchUnresolved = true;
+  return "pending";
 }
 
 // Brings every non-terminal worker up to date. Terminal only after the process is verifiably gone.

@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { killTree, minutes, normalizeEffort } from "../lib/codex.mjs";
+import { detectConfinement } from "../lib/confinement.mjs";
 import { guardActive } from "../lib/exchange.mjs";
 import { TandemError } from "../lib/output.mjs";
 import { ensureLayout, requireAbsolute } from "../lib/paths.mjs";
@@ -60,6 +61,16 @@ async function start({ project, options }) {
       throw new TandemError("too_many_workers", `${active.length} workers are already active (max ${MAX_ACTIVE_WORKERS}).`, "Wait for one (`worker wait <id>`) or cancel it (`worker cancel <id>`).");
     }
     const zone = checkZone({ project, zone: zoneArg, activeZones: active });
+    // Fail-closed: without an OS mechanism that takes every descendant down with the worker, a background
+    // process started inside the zone could outlive the worker and keep writing after the zone is released.
+    const confinement = detectConfinement();
+    if (confinement.kind === "none" && process.env.TANDEM_ALLOW_UNCONFINED_WORKERS !== "1") {
+      throw new TandemError(
+        "unconfined_platform",
+        `Workers need OS-level process confinement (Windows Job Object or a systemd user scope); this platform offers none: ${confinement.detail}.`,
+        "Descendants of a worker could outlive it and keep writing into a released zone. Set TANDEM_ALLOW_UNCONFINED_WORKERS=1 only if the user accepts that risk knowingly."
+      );
+    }
     try {
       await ensureBudget(state, { minRemaining: minRemainingOf(options) });
     } catch (error) {
@@ -80,7 +91,7 @@ async function start({ project, options }) {
     // 1. Reserve the record (id, zone, deadline) BEFORE any write-capable process exists. If the runner dies
     //    from here on, the launcher's launched.json lets the next refresh adopt the pid (unknown identity).
     const worker = {
-      id, zone, pid: null, procStart: null, identityPending: true, effort, model, status: "starting",
+      id, zone, pid: null, procStart: null, identityPending: true, effort, model, status: "starting", confinement: confinement.kind,
       startedAt: new Date(now).toISOString(), deadlineAt: new Date(now + deadlineMs).toISOString(),
       briefPath, resultPath, logPath, usageBooked: false
     };
@@ -89,7 +100,7 @@ async function start({ project, options }) {
     // 2. Start the process.
     let pid;
     try {
-      ({ pid } = await spawnDetachedCodex({ args: buildWorkerArgs({ zone, effort, outFile: resultPath, model }), stdinFile: briefPath, logFile: logPath, cwd: zone }));
+      ({ pid } = await spawnDetachedCodex({ args: buildWorkerArgs({ zone, effort, outFile: resultPath, model }), stdinFile: briefPath, logFile: logPath, cwd: zone, confinement: confinement.kind }));
     } catch (error) {
       Object.assign(worker, { status: "failed", failure: "spawn_failed", errors: [error.message], finishedAt: new Date().toISOString() });
       saveState(project, state);

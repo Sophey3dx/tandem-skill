@@ -51,8 +51,9 @@ test("no descendant outlives the worker: a grandchild orphaned by its parent is 
   const dir = makeProject("launch-tree");
   const logFile = path.join(dir, "log.txt");
   const late = path.join(dir, "late.txt");
-  // Windows: even a detached grandchild dies with the Job Object. POSIX: the process group covers a grandchild
-  // that stays in the group (a setsid escapee is a documented limitation there).
+  // Windows: even a detached grandchild dies with the Job Object. POSIX without a systemd scope (this test runs
+  // the launcher with the default confinement of the platform): the process group covers a grandchild that
+  // stays in the group; a setsid escapee is only covered by the systemd scope the runner uses on Linux.
   const detached = process.platform === "win32";
   const probe = `const { spawn } = require("node:child_process"); const g = spawn(process.execPath, ["-e", "setTimeout(() => require('fs').writeFileSync(" + JSON.stringify(${JSON.stringify(late)}) + ", 'late'), 3000)"], { detached: ${detached}, stdio: "ignore", windowsHide: true }); g.unref(); process.stdout.write("grandchild " + g.pid + "\\n"); process.exit(0)`;
   // detached + TANDEM_LAUNCH_GROUP mirror how the runner starts the launcher (POSIX group leader).
@@ -101,7 +102,7 @@ test("the launcher reports a command that cannot be started (no shell, no throw)
   const dir = makeProject("launch-missing");
   const logFile = path.join(dir, "log.txt");
   // Without the job wrapper the spawn error surfaces directly; with it the wrapper reports a failed start.
-  const result = launch(logFile, path.join(dir, "missing-codex.exe"), ["exec"], { env: { TANDEM_TEST_NO_JOB: "1" } });
+  const result = launch(logFile, path.join(dir, "missing-codex.exe"), ["exec"], { env: { TANDEM_CONFINEMENT: "none" } });
   assert.equal(result.status, 127);
   const exit = exitRecord(logFile);
   assert.equal(exit.code, 127);

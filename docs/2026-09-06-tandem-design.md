@@ -149,6 +149,13 @@ Codex liest die Dateien selbst (read-only). Antwort nach `verdict.schema.json`.
 - **Regeln:** Claude fasst eine aktive Zone nicht an. Worker committen nie und ändern keine gemeinsamen Builds/Caches (im Brief verboten; außerhalb der Zone durch die Sandbox verhindert).
 - **Rückgabe** nach `worker-result.schema.json`. Claude verifiziert den **echten Diff** (Git: `git status`/`git diff -- <zone>`; ohne Git: Dateiliste + Hashes vor/nach), führt die Tests aus, integriert, und macht einen Begleiter-Checkpoint zur Integration.
 
+**Zuteilung nach Stärken (Entscheidung des Nutzers, 2026-09-06):** Die Arbeitsteilung folgt den belegten Stärken der beiden Modelle, nicht dem Zufall.
+- **An Codex (Worker) geht,** was sich in Akzeptanztests fassen lässt, die in der Zone laufen, und keinen Kontext außerhalb von Brief + Repo braucht: Tests und Fixtures für vorhandenen Code schreiben, Parser/Validator/Konverter gegen eine Spezifikation, Modul-Portierung nach Vorlage, Migrationen mit klarer Zielstruktur, Repo-Recherche mit Bericht, Referenz-Doku aus Code, Audit einer Zone. Codex liest groß und geduldig, hält Verträge strikt ein, findet Edge-Cases und Concurrency-Fehler und arbeitet in einer Sandbox ohne Ablenkung.
+- **Bei Claude bleibt,** was Nutzerkontakt, Geschmack oder Gesamtkontext braucht: UI/UX und Texte für den Nutzer, visuelle Prüfung im Browser, Architektur- und Scope-Entscheidungen, Änderungen quer über viele Ordner (Zonen greifen nicht), Integration der Worker-Ergebnisse, Ledger und Entscheidungen, alles Sicherheitskritische mit Nutzer-Stopp.
+- **Bewährte Muster:** Claude baut Skelett und Schnittstellen, Codex füllt Zonen mit Implementierung und Tests dagegen; Codex schreibt zuerst die Tests einer Zone, Claude implementiert; Codex auditiert eine Zone, während Claude woanders weiterbaut.
+- **Effort und Modell je Auftragstyp:** mechanisch und klar umrissen → Effort `low`/`medium`, optional ein schnelleres Codex-Modell per `worker start --model <name>` (Nutzer entscheidet, kein Standard); knifflig (Concurrency, Security, Migration, Datenverlust möglich) → Effort `high`. Der Tandem-Thread selbst behält immer das Modell aus der Nutzer-Config.
+- Der Worker-Brief nennt unter `## Auftragstyp` die Kategorie und in einem Satz, warum der Auftrag zu Codex passt; passt er nicht, macht Claude ihn selbst.
+
 ### 4.5 Abschluss: zwei unabhängige Urteile
 1. **Dauer-Thread** (`contact --kind final`, Effort medium, high bei Security/Daten/Concurrency): prüft Zieltreue, Umsetzung angenommener Einwände, offene Punkte.
 2. **Frischer Diff-Review** (`review --uncommitted` bzw. `--base`, ohne Gesprächsbias): ein frischer `codex exec`-Thread mit Review-Vertrag liest den Diff selbst und sucht echte Bugs (nicht `codex exec review`, das das Ausgabeschema ignoriert); ein Schema-Retry resumiert diesen Thread. Ohne Git: `contact --kind final` mit Dateiliste und Diff-Auszug.
@@ -209,7 +216,7 @@ Eine **read-only Zeitleiste** des Austauschs zwischen Claude und Codex im Browse
 | `contact` | `--kind checkpoint\|resume\|final\|sparring` `--prompt-file <abs>` `[--effort]` `[--deadline-min]` | Resume-Kontakt, `{contactId, verdict…, replyPath, durationMs}` |
 | `plan-round` | `--round 1..3` `--plan-file <abs>` `[--matrix-file <abs>]` | Planrunde mit `plan-verdict`; Runde 4 → Fehler |
 | `lane` | `--kind gegenposition\|premortem\|alternative` `--prompt-file <abs>` | Fork-Lane, `sparring`-JSON |
-| `worker start` | `--zone <abs>` `--brief-file <abs>` `[--effort]` `[--deadline-min 20]` | Zonen-Prüfung, detached Start, `{workerId, pid, deadlineAt}` |
+| `worker start` | `--zone <abs>` `--brief-file <abs>` `[--effort]` `[--deadline-min 20]` `[--model <name>]` | Zonen-Prüfung, detached Start, `{workerId, pid, deadlineAt}`; `--model` nur für Worker (Zuteilung nach Stärken) |
 | `worker status [id]` / `worker wait <id>` / `worker cancel <id>` | — | Status, Warten bis Ergebnis/Deadline, Abbruch |
 | `review` | `--uncommitted \| --base <ref> \| --commit <sha>` `[--effort]` `[--title]` | frischer `codex exec review`, `verdict`-JSON; ohne Git → Fehler mit Hinweis auf `contact --kind final` |
 | `design start` | `--topic <t>` `--brief-file <abs>` `[--vite]` `[--effort medium]` `[--deadline-min 20]` | Runde N anlegen (Standalone unter `.tandem/design/<N>/`, Vite unter `src/tandem-lab/<N>/` + Einstieg), Codex-Worker in der Codex-Zone starten, `{round, paths, workerId}` |

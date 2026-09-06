@@ -3,7 +3,7 @@ import path from "node:path";
 import { TandemError } from "./output.mjs";
 import { SCHEMAS_DIR } from "./paths.mjs";
 
-export const SCHEMA_NAMES = ["verdict", "plan-verdict"];
+export const SCHEMA_NAMES = ["verdict", "plan-verdict", "worker-result", "sparring"];
 
 export function schemaPath(name) {
   if (!SCHEMA_NAMES.includes(name)) {
@@ -97,12 +97,37 @@ export function semanticErrors(schemaName, value, { idPrefix, round } = {}) {
       });
     }
   }
+  if (schemaName === "sparring") {
+    if (!String(value?.position ?? "").trim()) errors.push("$.position: must not be empty");
+    if (!String(value?.recommendation ?? "").trim()) errors.push("$.recommendation: must not be empty");
+    for (const key of ["reasons", "risks"]) {
+      if (Array.isArray(value?.[key]) && value[key].length > 8) errors.push(`$.${key}: more than 8 items`);
+    }
+  }
+  if (schemaName === "worker-result") {
+    const remaining = Array.isArray(value?.remaining) ? value.remaining : [];
+    const blockers = Array.isArray(value?.blockers) ? value.blockers : [];
+    if (value?.status === "DONE" && (remaining.length > 0 || blockers.length > 0)) errors.push("$.status: DONE contradicts remaining work or blockers");
+    if (value?.status === "BLOCKED" && blockers.length === 0) errors.push("$.status: BLOCKED requires at least one blocker with evidence");
+    if (value?.status === "PARTIAL" && remaining.length === 0) errors.push("$.status: PARTIAL requires remaining work");
+    blockers.forEach((blocker, index) => {
+      if (!String(blocker?.text ?? "").trim()) errors.push(`$.blockers[${index}].text: must not be empty`);
+      if (!String(blocker?.evidence ?? "").trim()) errors.push(`$.blockers[${index}].evidence: must not be empty`);
+    });
+    remaining.forEach((item, index) => {
+      if (!String(item ?? "").trim()) errors.push(`$.remaining[${index}]: must not be empty`);
+    });
+  }
   return errors;
 }
 
-export function parseReplyFile(file, schemaName, { idPrefix, round } = {}) {
+export function parseReplyFile(file, schemaName, options = {}) {
   if (!fs.existsSync(file)) return { parsed: null, errors: [`reply file missing: ${file}`], raw: null };
-  const raw = fs.readFileSync(file, "utf8");
+  return parseReplyText(fs.readFileSync(file, "utf8"), schemaName, options);
+}
+
+// Same validation for a reply that did not come from a file (e.g. the final agent message in a worker log).
+export function parseReplyText(raw, schemaName, { idPrefix, round } = {}) {
   let value;
   try {
     value = JSON.parse(raw);

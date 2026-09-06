@@ -10,7 +10,8 @@ import { loadState, saveState, withLock } from "../lib/state.mjs";
 export const KINDS = {
   checkpoint: { schema: "verdict", effort: "low", deadline: 5 },
   resume: { schema: "verdict", effort: "low", deadline: 5 },
-  final: { schema: "verdict", effort: "medium", deadline: 8 }
+  final: { schema: "verdict", effort: "medium", deadline: 8 },
+  sparring: { schema: "sparring", effort: "medium", deadline: 8 }
 };
 
 const CAPS = {
@@ -21,7 +22,7 @@ const CAPS = {
 export async function runContact({ project, options }) {
   const kind = String(options.kind ?? "");
   if (!KINDS[kind]) {
-    throw new TandemError("bad_kind", `Unknown --kind "${kind}".`, `Use one of: ${Object.keys(KINDS).join(", ")} (sparring folgt in Plan B).`);
+    throw new TandemError("bad_kind", `Unknown --kind "${kind}".`, `Use one of: ${Object.keys(KINDS).join(", ")}.`);
   }
   const promptFile = requireAbsolute(options["prompt-file"], "--prompt-file");
   const spec = KINDS[kind];

@@ -73,7 +73,7 @@ export function saveState(projectRoot, state) {
   return state;
 }
 
-function pidAlive(pid) {
+export function pidAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);

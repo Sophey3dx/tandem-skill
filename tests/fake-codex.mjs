@@ -9,7 +9,10 @@
 //   FAKE_PLAN_RISK       text for criteria.residualRisk
 //   FAKE_USED_PRIMARY / FAKE_USED_SECONDARY   usedPercent for the fake app-server
 //   FAKE_RATELIMIT_MODE  ok | error | silent | crash
+//   FAKE_WORKER_NO_RESULT=1   worker: emit the events (incl. the final message) but never write the -o file
+//   FAKE_WORKER_EXIT_CODE     worker: exit with this code after the events (default 0)
 import fs from "node:fs";
+import path from "node:path";
 
 const argv = process.argv.slice(2);
 const mode = process.env.FAKE_CODEX_MODE ?? "ok";
@@ -60,8 +63,26 @@ function sampleFor(schema, stdin) {
       residualRisk: "gering"
     };
   }
-  if (schema.properties?.status) return { status: "DONE", touchedFiles: [], tests: [], remaining: [], blockers: [], notes: "fake" };
-  return { position: "fake", reasons: [], checked: [], risks: [], recommendation: "fake" };
+  if (schema.properties?.status) {
+    const status = process.env.FAKE_WORKER_STATUS ?? "DONE";
+    const zone = opt("-C");
+    if (zone && process.env.FAKE_WORKER_WRITE === "1") fs.writeFileSync(path.join(zone, "ok.txt"), "ok", "utf8");
+    return {
+      status,
+      touchedFiles: ["ok.txt"],
+      tests: [{ cmd: "node --test", exitCode: 0 }],
+      remaining: status === "PARTIAL" ? ["rest of the task"] : [],
+      blockers: status === "BLOCKED" ? [{ text: "fake blocker", evidence: "ok.txt:1" }] : [],
+      notes: "fake worker"
+    };
+  }
+  return {
+    position: process.env.FAKE_SPARRING_EMPTY === "1" ? "" : "fake position",
+    reasons: ["r1"],
+    checked: ["src/a.js"],
+    risks: ["risk"],
+    recommendation: "do it"
+  };
 }
 
 // FAKE_USED_PRIMARY_SEQUENCE="18,97" lets consecutive rate-limit queries (counted via FAKE_CODEX_LOG) return
@@ -147,17 +168,30 @@ function exec() {
   emit({ type: "thread.started", thread_id: threadId });
   emit({ type: "turn.started" });
   let text;
+  let isWorker = false;
   if (schemaFile) {
     const schema = JSON.parse(fs.readFileSync(schemaFile, "utf8"));
-    text = JSON.stringify(mode === "invalid_json" ? { verdict: "MAYBE" } : sampleFor(schema, stdin));
+    isWorker = Boolean(schema.properties?.status);
+    let invalid = mode === "invalid_json";
+    if (isWorker && process.env.FAKE_WORKER_INVALID === "1") invalid = true;
+    if (isWorker && process.env.FAKE_WORKER_INVALID_ONCE && !fs.existsSync(process.env.FAKE_WORKER_INVALID_ONCE)) {
+      fs.writeFileSync(process.env.FAKE_WORKER_INVALID_ONCE, "seen", "utf8");
+      invalid = true;
+    }
+    text = JSON.stringify(invalid ? { verdict: "MAYBE", status: "MAYBE" } : sampleFor(schema, stdin));
   } else {
     text = process.env.FAKE_CODEX_REPLY ?? "FAKE OK";
   }
   emit({ type: "item.completed", item: { id: "item_0", type: "agent_message", text } });
-  if (out) fs.writeFileSync(out, text, "utf8");
+  // Like codex, the -o file is written after the final message; FAKE_WORKER_NO_RESULT simulates a codex that
+  // dies during shutdown and never gets to it.
+  if (out && !(isWorker && process.env.FAKE_WORKER_NO_RESULT === "1")) fs.writeFileSync(out, text, "utf8");
   emit({ type: "turn.completed", usage: { input_tokens: 100, cached_input_tokens: 0, cache_write_input_tokens: 0, output_tokens: 20, reasoning_output_tokens: 0 } });
   process.stderr.write("tokens used\n1.234\n");
-  process.exit(0);
+  const exitCode = isWorker && process.env.FAKE_WORKER_EXIT_CODE ? Number(process.env.FAKE_WORKER_EXIT_CODE) : 0;
+  const linger = Number(process.env.FAKE_WORKER_LINGER_MS ?? 0);
+  if (linger > 0 && isWorker) setTimeout(() => process.exit(exitCode), linger);
+  else process.exit(exitCode);
 }
 
 if (argv[0] === "--version") {

@@ -108,7 +108,7 @@ All Codex calls go through `scripts/tandem.mjs`. It prints exactly one JSON line
 | `contact --kind sparring --prompt-file <abs>` | Free-form question with the sparring schema (position, reasons, risks, recommendation). |
 | `lane --kind gegenposition\|premortem\|alternative --prompt-file <abs>` | Ephemeral fork of the thread; one schema retry by forking again. |
 | `worker start --zone <abs> --brief-file <abs> [--effort] [--deadline-min 20] [--model <name>]` | Validates the zone and the brief (ten mandatory headings), appends the worker contract, starts Codex detached with `workspace-write` confined to the zone. |
-| `worker status [id]`, `worker wait <id> [--poll-sec 5]`, `worker cancel <id>` | Lifecycle: results are validated after the process exits, deadlines and cancels kill the verified process tree and wait for it to disappear, usage is booked from the log. |
+| `worker status [id]`, `worker wait <id> [--poll-sec 5]`, `worker cancel <id>` | Lifecycle: results are validated after the process exits, deadlines and cancels kill the verified process tree and wait for it to disappear, usage is booked from the log. The exit code of the detached process is recorded (`exitCode`, appended to the log by a tiny launcher), and a report that Codex left only in its log is accepted as `resultSource: "log"`. |
 
 ### Contact envelope
 
@@ -192,7 +192,7 @@ scripts/
   tandem.mjs            CLI entry: arguments, dispatch, JSON output
   lib/                  args, paths, state (atomic + lock), codex adapter, rate limits, schema validator,
                         usage, prompts, exchange (the shared contact flow), zones, procs (process identity),
-                        workers (detached lifecycle)
+                        workers (detached lifecycle), worker-launch (records the exit code of a detached worker)
   commands/             doctor, start, contact, plan-round, review, status, control, rotate, worker, lane
 references/
   schemas/              verdict, plan-verdict, worker-result, sparring
@@ -201,12 +201,13 @@ references/
   contracts.md          the contracts in prose (for Claude)
 tests/
   fake-codex.mjs        simulates codex exec / resume / review / app-server / login
-  *.test.mjs            105 tests, `node --test`
+  *.test.mjs            112 tests, `node --test`
   smoke.mjs             opt-in end-to-end run against the real Codex (costs tokens)
   smoke-workers.mjs     opt-in: lane + sandboxed worker with a safe isolation probe (costs tokens)
 docs/
   2026-09-06-tandem-design.md         design spec (German)
   plans/2026-09-06-tandem-core.md     implementation plan A with full code
+  plans/2026-09-06-tandem-plan-b.md   implementation plan B (workers, sparring, lanes) with the consensus rounds
 SKILL.md                the skill Claude Code loads (German)
 ```
 
@@ -217,7 +218,7 @@ Inside a project, tandem keeps everything under `.tandem/` (state, lock, ledger,
 ## Development
 
 ```bash
-npm test                                          # 105 tests against the fake codex, no tokens spent
+npm test                                          # 112 tests against the fake codex, no tokens spent
 node tests/smoke.mjs C:\path\outside\TEMP         # real Codex, low effort, a few thousand tokens
 node tests/smoke-workers.mjs C:\path\outside\TEMP # real Codex: lane + sandboxed worker with isolation probe
 ```
@@ -225,6 +226,8 @@ node tests/smoke-workers.mjs C:\path\outside\TEMP # real Codex: lane + sandboxed
 The fake Codex is driven by environment variables (`FAKE_CODEX_MODE=hang|fail|thread_lost|quota|auth|invalid_json`, `FAKE_USED_PRIMARY`, `FAKE_RATELIMIT_MODE=error|silent|crash`, …) so every failure path is covered without touching the network. `TANDEM_CODEX_BIN` points the runner at any binary or `.mjs` file.
 
 Verified against Codex CLI 0.153.2 on 2026-09-06: cross-process `codex exec resume`, `--output-schema` with strict schemas, `account/rateLimits/read` over the app-server, and the Windows restricted-token sandbox confining `workspace-write` to the working directory (as long as the project is not under `%TEMP%`). Also verified, the hard way: `codex exec review` ignores `--output-schema` and answers in prose, which is why the final review runs as a plain `codex exec` thread with its own review contract.
+
+Observed once on 2026-09-06 with a worker in a zone: Codex completed the turn and printed its final message, then exited during its internal shutdown without writing the `-o` file (in `codex exec`, `print_final_output` runs only after `client.shutdown()`). Two consequences in the runner: every worker starts through `scripts/lib/worker-launch.mjs`, which appends `{"type":"tandem.exit","code":…}` to the worker log so the exit code of a process nobody waits for is known; and a worker whose `-o` file is missing is settled from the final agent message of the completed turn in its log (`resultSource: "log"`). Codex writes the file from exactly that message, so both sources are equivalent. A worker is `orphaned` only when neither exists. Related: the Windows sandbox grants a per-run SID modify rights on the zone folder and does not remove that entry when Codex exits (`icacls <zone>` shows it). It is harmless, but it is visible.
 
 ---
 

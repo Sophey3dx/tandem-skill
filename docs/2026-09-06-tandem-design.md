@@ -244,7 +244,9 @@ Alle Befehle: `--project <abs>` optional (default: cwd), Ausgabe eine JSON-Zeile
 | Codex-Version gewechselt | `doctor` und `start` vergleichen mit `state.codexVersion` | Vermerk (`versionChanged`) + Smoke-Kontakt (Effort low) |
 | Zustand beschädigt | JSON-Parse-Fehler | Runner bricht ab, `error: state_corrupt`, Hinweis auf `state.json.bak` (der Runner hält eine Sicherung des letzten gültigen Zustands) |
 | Veralteter Lock | PID nicht mehr lebend oder Lock älter als 30 min | Lock entfernen, weiter |
-| Verwaister Worker | PID tot, kein `result.json` | Status „orphaned"; Claude prüft Diff der Zone |
+| Codex beendet sich ohne `result.json` | Prozess weg, Log enthält `turn.completed` und die letzte Agent-Nachricht | Ergebnis aus dem Log übernehmen (`resultSource: log`), Exitcode aus dem Launcher-Eintrag `tandem.exit` vermerken |
+| Verwaister Worker | Prozess weg, weder `result.json` noch Abschlussmeldung im Log | Status „orphaned" mit `exitCode`; Claude prüft Diff der Zone |
+| Startzeit-Abfrage schlägt fehl (PowerShell/ps antwortet nicht) | PID lebt, Identität gerade nicht prüfbar | Worker gilt als lebend („unverified"), wird aber nicht beendet; ein Kill bleibt `killing`, bis die Identität wieder prüfbar ist |
 
 Der Runner wiederholt **nie** selbstständig Codex-Aufrufe (Kosten). Jeder Fehler nennt einen `hint` für Claude.
 
@@ -407,7 +409,7 @@ Jeder Prompt enthält einen **Output-Cap** (max. Punkte, max. Zeilen). Die Anzah
 - Worker (Zonen per Sandbox mit realpath-Prüfung, detached ohne Shell, verifizierte Prozessidentität, Deadlines, strukturierte Rückgabe mit einem budgetgeprüften Schema-Retry), Sparring-Kontakte, Fork-Lanes, Zuteilung nach Stärken; `status` und `stop` kennen Worker.
 - Plan B wurde als erster echter Plan-Konsens über den Dauer-Thread des Skill-Repos verhandelt: drei Runden, 16 Einwände, alle übernommen; nach Runde 3 ohne Konsens Entscheidung des Nutzers, P3-1 bis P3-4 einzuarbeiten und zu bauen.
 - Verifiziert gegen echtes Codex: `codex exec fork --ephemeral` mit Schema (Lane) und ein Worker in einer Zone inklusive sicherem Isolations-Negativtest (Smoke `tests/smoke-workers.mjs`).
-- Spec freigegeben; nächster Schritt writing-plans, danach Duofold-Prüfung des Plans.
+- Härtung nach dem ersten Smoke: Codex 0.153.2 beendete sich nach regulärem `task_complete` während des internen Shutdowns, ohne die `-o`-Datei zu schreiben (Windows, nach Sandbox-Kommandos; in `codex exec` läuft `print_final_output` erst nach `client.shutdown()`). Seitdem startet der Runner Worker über `lib/worker-launch.mjs` (Exitcode landet als `tandem.exit` im Log), übernimmt ein fehlendes Ergebnis aus der letzten Agent-Nachricht des Logs (`resultSource: log`) und behandelt eine fehlgeschlagene Startzeit-Abfrage als „unverified" statt „gone".
 
 **Codex-Review (Duofold, Modus idee, Standard), eingearbeitet**
 - Kanal A bestätigt; B und C verworfen bzw. auf v2 verschoben.

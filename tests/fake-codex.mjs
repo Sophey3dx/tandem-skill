@@ -9,6 +9,8 @@
 //   FAKE_PLAN_RISK       text for criteria.residualRisk
 //   FAKE_USED_PRIMARY / FAKE_USED_SECONDARY   usedPercent for the fake app-server
 //   FAKE_RATELIMIT_MODE  ok | error | silent | crash
+//   FAKE_WORKER_NO_RESULT=1   worker: emit the events (incl. the final message) but never write the -o file
+//   FAKE_WORKER_EXIT_CODE     worker: exit with this code after the events (default 0)
 import fs from "node:fs";
 import path from "node:path";
 
@@ -181,12 +183,15 @@ function exec() {
     text = process.env.FAKE_CODEX_REPLY ?? "FAKE OK";
   }
   emit({ type: "item.completed", item: { id: "item_0", type: "agent_message", text } });
-  if (out) fs.writeFileSync(out, text, "utf8");
+  // Like codex, the -o file is written after the final message; FAKE_WORKER_NO_RESULT simulates a codex that
+  // dies during shutdown and never gets to it.
+  if (out && !(isWorker && process.env.FAKE_WORKER_NO_RESULT === "1")) fs.writeFileSync(out, text, "utf8");
   emit({ type: "turn.completed", usage: { input_tokens: 100, cached_input_tokens: 0, cache_write_input_tokens: 0, output_tokens: 20, reasoning_output_tokens: 0 } });
   process.stderr.write("tokens used\n1.234\n");
+  const exitCode = isWorker && process.env.FAKE_WORKER_EXIT_CODE ? Number(process.env.FAKE_WORKER_EXIT_CODE) : 0;
   const linger = Number(process.env.FAKE_WORKER_LINGER_MS ?? 0);
-  if (linger > 0 && isWorker) setTimeout(() => process.exit(0), linger);
-  else process.exit(0);
+  if (linger > 0 && isWorker) setTimeout(() => process.exit(exitCode), linger);
+  else process.exit(exitCode);
 }
 
 if (argv[0] === "--version") {

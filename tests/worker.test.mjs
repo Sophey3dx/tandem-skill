@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { killTree } from "../scripts/lib/codex.mjs";
+import { killTree, parseJsonl } from "../scripts/lib/codex.mjs";
 import { sleepSync } from "../scripts/lib/procs.mjs";
 import { makeProject, readLog, runTandem, startProject, writeFile } from "./helpers.mjs";
 
@@ -265,4 +265,67 @@ test("a worker that dies with a quota error pauses tandem", () => {
   assert.equal(waited.json.worker.status, "failed");
   assert.equal(waited.json.worker.failure, "quota");
   assert.equal(stateOf(dir).paused, true);
+});
+
+test("a codex that exits without writing the result file is settled from the final message in its log", () => {
+  const { dir, zone, brief } = prepared("worker-no-result");
+  // Codex writes -o only after its internal shutdown; a codex dying there leaves the report in the log only.
+  const started = runTandem(["worker", "start", "--zone", zone, "--brief-file", brief], { cwd: dir, env: { FAKE_WORKER_NO_RESULT: "1", FAKE_WORKER_WRITE: "1" } });
+  assert.equal(started.json.ok, true, JSON.stringify(started.json));
+  const waited = runTandem(["worker", "wait", "W1", "--poll-sec", "1"], { cwd: dir });
+  assert.equal(waited.json.worker.status, "done", JSON.stringify(waited.json));
+  assert.equal(waited.json.worker.result.status, "DONE");
+  assert.equal(waited.json.worker.resultSource, "log");
+  assert.equal(waited.json.worker.exitCode, 0);
+  assert.equal(waited.json.worker.retried, undefined, "no retry call: the log already holds a valid report");
+  assert.equal(fs.existsSync(path.join(dir, ".tandem", "workers", "W1", "result.json")), false);
+  const events = parseJsonl(fs.readFileSync(path.join(dir, ".tandem", "workers", "W1", "log.txt"), "utf8"));
+  assert.equal(events.at(-1).type, "tandem.exit", "the launcher appends the exit record last");
+  assert.equal(stateOf(dir).usage.byKind.worker.runs, 1);
+  const zone2 = path.join(dir, "zone2");
+  fs.mkdirSync(zone2);
+  const normal = runTandem(["worker", "start", "--zone", zone2, "--brief-file", brief], { cwd: dir });
+  const done = runTandem(["worker", "wait", normal.json.worker.id, "--poll-sec", "1"], { cwd: dir });
+  assert.equal(done.json.worker.resultSource, "file");
+  assert.equal(done.json.worker.exitCode, 0);
+});
+
+test("a worker that dies without any report is orphaned with its exit code; a non-zero exit with a valid report still counts", () => {
+  const { dir, zone, brief } = prepared("worker-exit-codes");
+  const crashed = runTandem(["worker", "start", "--zone", zone, "--brief-file", brief], { cwd: dir, env: { FAKE_CODEX_MODE: "fail" } });
+  assert.equal(crashed.json.ok, true, JSON.stringify(crashed.json));
+  const waited = runTandem(["worker", "wait", crashed.json.worker.id, "--poll-sec", "1"], { cwd: dir });
+  assert.equal(waited.json.worker.status, "orphaned", JSON.stringify(waited.json));
+  assert.equal(waited.json.worker.failure, "codex_failed");
+  assert.equal(waited.json.worker.exitCode, 2);
+  assert.equal(waited.json.worker.exitSignal, null);
+  assert.equal(stateOf(dir).paused, false, "an unclassified crash does not pause tandem");
+  const zone2 = path.join(dir, "zone2");
+  fs.mkdirSync(zone2);
+  const odd = runTandem(["worker", "start", "--zone", zone2, "--brief-file", brief], { cwd: dir, env: { FAKE_WORKER_EXIT_CODE: "3" } });
+  const settled = runTandem(["worker", "wait", odd.json.worker.id, "--poll-sec", "1"], { cwd: dir });
+  assert.equal(settled.json.worker.status, "done", "a valid report wins over the exit code");
+  assert.equal(settled.json.worker.exitCode, 3);
+  assert.equal(settled.json.worker.resultSource, "file");
+});
+
+test("a failing start-time query never declares a live worker gone and never lets it be killed", () => {
+  const { dir, zone, brief } = prepared("worker-hiccup");
+  const a = runTandem(["worker", "start", "--zone", zone, "--brief-file", brief, "--deadline-min", "5"], { cwd: dir, env: { FAKE_CODEX_MODE: "hang" } });
+  assert.equal(a.json.ok, true, JSON.stringify(a.json));
+  assert.ok(Number.isFinite(a.json.worker.procStart));
+  const hiccup = { TANDEM_TEST_START_TIME_FAIL: "1" }; // PowerShell/ps does not answer right now
+  const status = runTandem(["worker", "status", "W1"], { cwd: dir, env: hiccup });
+  assert.equal(status.json.workers[0].status, "running", "still running, not orphaned");
+  assert.equal(status.json.active, 1, "zone stays reserved");
+  const cancelled = runTandem(["worker", "cancel", "W1"], { cwd: dir, env: hiccup });
+  assert.equal(cancelled.json.gone, false);
+  assert.equal(cancelled.json.worker.status, "killing");
+  assert.equal(cancelled.json.worker.killBlockedBy, "identity_unverified");
+  const state = stateOf(dir);
+  assert.equal(state.workers[0].procStart, a.json.worker.procStart, "the recorded identity is untouched");
+  const again = runTandem(["worker", "cancel", "W1"], { cwd: dir }); // the query works again: verified, killed
+  assert.equal(again.json.gone, true, JSON.stringify(again.json));
+  assert.equal(again.json.worker.status, "cancelled");
+  assert.equal(runTandem(["worker", "status"], { cwd: dir }).json.active, 0);
 });

@@ -1,20 +1,24 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { buildResumeArgs, classifyFailure, killTree, parseJsonl, resolveCodex, runCodex, threadIdFromEvents } from "./codex.mjs";
 import { noteFailure } from "./exchange.mjs";
-import { sameProcess, sleepSync } from "./procs.mjs";
+import { processState, sameProcess, sleepSync } from "./procs.mjs";
 import { ensureBudget } from "./ratelimits.mjs";
-import { parseReplyFile, schemaPath } from "./schema.mjs";
+import { parseReplyFile, parseReplyText, schemaPath } from "./schema.mjs";
 import { addUsage } from "./state.mjs";
 import { extractUsage } from "./usage.mjs";
 
 export const TERMINAL_STATUSES = new Set(["done", "partial", "blocked", "timeout", "orphaned", "cancelled", "invalid_output", "failed"]);
 export const ACTIVE_STATUSES = new Set(["running", "finishing", "killing"]);
 export const REQUIRED_BRIEF_SECTIONS = ["Auftragstyp", "Baseline", "Ziel", "Nicht-Ziele", "Erlaubte Dateien", "Schnittstellen", "Akzeptanztests", "Löschrechte", "Stop-Bedingungen", "Kontext aus dem Ledger"];
+const LAUNCHER = fileURLToPath(new URL("./worker-launch.mjs", import.meta.url));
 const KILL_CONFIRM_MS = 5000;
 const RETRY_EFFORT = "low";
 const RETRY_DEADLINE_MS = 5 * 60 * 1000;
+// Failure classes that mean "codex refused or lost the session" rather than "the process vanished".
+const FAILED_CLASSES = new Set(["quota", "auth", "thread_lost"]);
 
 function escapeRegExp(text) {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -32,17 +36,19 @@ export function buildWorkerArgs({ zone, effort, outFile, model = null }) {
   ];
 }
 
-// Starts codex detached WITHOUT any shell: stdin is the opened brief file, stdout and stderr are the opened
-// log file (inherited descriptors), so no cmd.exe/sh quoting or %VAR% expansion can ever rewrite a validated
-// path. The pid is the codex launcher itself (`taskkill /T` kills its tree; on POSIX the detached process
-// leads its own group). Identity (start time) is captured by the caller AFTER the record is persisted.
+// Starts codex detached WITHOUT any shell, through the tiny launcher in worker-launch.mjs: stdin is the
+// opened brief file, stdout and stderr are the opened log file (inherited descriptors), so no cmd.exe/sh
+// quoting or %VAR% expansion can ever rewrite a validated path. The launcher appends a final
+// {"type":"tandem.exit"} line to the log when codex exits, so the exit code survives although nobody waits.
+// The pid is the launcher (`taskkill /T` kills its tree; on POSIX the detached process leads its own group).
+// Identity (start time) is captured by the caller AFTER the record is persisted.
 export function spawnDetachedCodex({ args, stdinFile, logFile, cwd, env = process.env }) {
   const { cmd, prefix } = resolveCodex(env);
   const inFd = fs.openSync(stdinFile, "r");
   const outFd = fs.openSync(logFile, "a");
   let child;
   try {
-    child = spawn(cmd, [...prefix, ...args], { cwd, env, detached: true, stdio: [inFd, outFd, outFd], windowsHide: true });
+    child = spawn(process.execPath, [LAUNCHER, logFile, cmd, ...prefix, ...args], { cwd, env, detached: true, stdio: [inFd, outFd, outFd], windowsHide: true });
   } finally {
     fs.closeSync(inFd);
     fs.closeSync(outFd);
@@ -57,6 +63,28 @@ function readLogText(logPath) {
   } catch {
     return "";
   }
+}
+
+function workerEvents(worker) {
+  return parseJsonl(readLogText(worker.logPath));
+}
+
+// The launcher's exit record, or null when the log has none (launcher killed from outside, log truncated).
+export function exitInfo(events) {
+  const record = [...events].reverse().find((e) => e?.type === "tandem.exit");
+  if (!record) return null;
+  return { code: Number.isInteger(record.code) ? record.code : null, signal: record.signal ?? null, error: record.error ?? null };
+}
+
+// The worker's final report: the -o file when codex wrote it, otherwise the final agent message of a
+// completed turn in the JSONL log. Codex writes the -o file from exactly that message, but only after its
+// internal shutdown; a codex that dies during shutdown (seen on Windows after sandboxed commands) leaves
+// the message in the log and nothing else. Returns { raw, source: "file" | "log" } or null.
+export function readWorkerResult(worker, events = workerEvents(worker)) {
+  if (fs.existsSync(worker.resultPath)) return { raw: fs.readFileSync(worker.resultPath, "utf8"), source: "file" };
+  if (!events.some((e) => e?.type === "turn.completed")) return null;
+  const message = [...events].reverse().find((e) => e?.type === "item.completed" && e.item?.type === "agent_message" && typeof e.item.text === "string" && e.item.text.trim() !== "");
+  return message ? { raw: message.item.text, source: "log" } : null;
 }
 
 // Usage from the log: JSONL events first, `tokens used` stderr line as fallback. Booked once, after exit.
@@ -74,12 +102,14 @@ function finish(state, worker, status, now, extra = {}) {
 }
 
 // Kills only a process that is verifiably ours (pid AND start time), then waits up to KILL_CONFIRM_MS for it
-// to disappear. Without a verified identity nothing is ever killed.
+// to disappear. Without a verified identity nothing is ever killed: an unknown identity (never captured) and
+// an unverifiable one (the start-time query fails right now) both leave the worker active as `killing`.
 export function killWorker(worker, env = process.env) {
-  if (worker.procStart === null || worker.procStart === undefined) {
-    return sameProcess(worker) ? { gone: false, killed: false, reason: "identity_unknown" } : { gone: true, killed: false };
+  const state = processState(worker);
+  if (state === "gone" || state === "foreign") return { gone: true, killed: false };
+  if (state === "unverified") {
+    return { gone: false, killed: false, reason: worker.procStart === null || worker.procStart === undefined ? "identity_unknown" : "identity_unverified" };
   }
-  if (!sameProcess(worker)) return { gone: true, killed: false };
   killTree(worker.pid, env);
   const until = Date.now() + KILL_CONFIRM_MS;
   while (Date.now() < until) {
@@ -94,7 +124,7 @@ export function killWorker(worker, env = process.env) {
 // attempted again on the next refresh), a model failure ends the worker with that failure and the usual
 // quota policy. Returns { parsed, errors, pending?, failure? }.
 async function retryWorkerResult(state, worker, { project, layout, env }) {
-  const threadId = threadIdFromEvents(parseJsonl(readLogText(worker.logPath)));
+  const threadId = threadIdFromEvents(workerEvents(worker));
   if (!threadId) {
     worker.retried = true;
     return { parsed: null, errors: ["no thread id in the worker log; cannot resume"] };
@@ -116,14 +146,17 @@ async function retryWorkerResult(state, worker, { project, layout, env }) {
     noteFailure(state, result);
     return { parsed: null, errors: [`retry failed: ${result.failure}`], failure: result.failure };
   }
-  return parseReplyFile(worker.resultPath, "worker-result");
+  return { ...parseReplyFile(worker.resultPath, "worker-result"), source: "retry" };
 }
 
 async function settleResult(state, worker, { project, layout, env, now }) {
-  let outcome = parseReplyFile(worker.resultPath, "worker-result");
+  const found = readWorkerResult(worker);
+  let outcome = found
+    ? { ...parseReplyText(found.raw, "worker-result"), source: found.source }
+    : { parsed: null, errors: [`reply file missing: ${worker.resultPath}`], source: null };
   if (!outcome.parsed && !worker.retried) outcome = await retryWorkerResult(state, worker, { project, layout, env });
   if (outcome.parsed) {
-    finish(state, worker, outcome.parsed.status.toLowerCase(), now, { result: outcome.parsed });
+    finish(state, worker, outcome.parsed.status.toLowerCase(), now, { result: outcome.parsed, resultSource: outcome.source });
   } else if (outcome.pending) {
     worker.status = "retry_pending"; // not terminal, zone free; retried on the next refresh
     worker.retryErrors = outcome.errors;
@@ -132,6 +165,14 @@ async function settleResult(state, worker, { project, layout, env, now }) {
   } else {
     finish(state, worker, "invalid_output", now, { errors: outcome.errors });
   }
+}
+
+function recordExit(worker, events) {
+  const exit = exitInfo(events);
+  if (!exit) return null;
+  Object.assign(worker, { exitCode: exit.code, exitSignal: exit.signal });
+  if (exit.error) worker.exitError = exit.error;
+  return exit;
 }
 
 // Brings every non-terminal worker up to date. Terminal only after the process is verifiably gone.
@@ -152,6 +193,7 @@ export async function refreshWorkers(state, { project, layout, now = Date.now(),
     const hasResult = fs.existsSync(worker.resultPath);
     if (worker.status === "killing") {
       if (alive) continue;
+      recordExit(worker, workerEvents(worker));
       finish(state, worker, worker.killReason, now, { killFailed: false });
       changed = true;
       continue;
@@ -168,13 +210,16 @@ export async function refreshWorkers(state, { project, layout, now = Date.now(),
       }
       continue;
     }
-    // Process gone.
-    if (hasResult) {
+    // Process gone: the -o file or, failing that, the final message in the log is the report.
+    const events = workerEvents(worker);
+    const exit = recordExit(worker, events);
+    if (readWorkerResult(worker, events)) {
       await settleResult(state, worker, { project, layout, env, now });
     } else {
-      const failure = classifyFailure({ status: 1, timedOut: false, stderr: readLogText(worker.logPath) });
+      // Exit code 0 without any report is "no_result"; a missing exit record (launcher killed) counts as 1.
+      const failure = classifyFailure({ status: exit?.code ?? 1, timedOut: false, stderr: readLogText(worker.logPath) }) ?? "no_result";
       if (failure === "quota") state.paused = true;
-      finish(state, worker, failure === "codex_failed" ? "orphaned" : "failed", now, { failure });
+      finish(state, worker, FAILED_CLASSES.has(failure) ? "failed" : "orphaned", now, { failure });
     }
     changed = true;
   }

@@ -114,9 +114,13 @@ export function semanticErrors(schemaName, value, { idPrefix, round } = {}) {
   return errors;
 }
 
-export function parseReplyFile(file, schemaName, { idPrefix, round } = {}) {
+export function parseReplyFile(file, schemaName, options = {}) {
   if (!fs.existsSync(file)) return { parsed: null, errors: [`reply file missing: ${file}`], raw: null };
-  const raw = fs.readFileSync(file, "utf8");
+  return parseReplyText(fs.readFileSync(file, "utf8"), schemaName, options);
+}
+
+// Same validation for a reply that did not come from a file (e.g. the final agent message in a worker log).
+export function parseReplyText(raw, schemaName, { idPrefix, round } = {}) {
   let value;
   try {
     value = JSON.parse(raw);

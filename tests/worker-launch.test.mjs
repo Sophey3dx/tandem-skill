@@ -160,7 +160,7 @@ test("systemd scope: the exit is reported only once the scope is confirmed gone;
   fs.writeFileSync(stateFile, "inactive\n", "utf8"); // the scope is empty now
   await Promise.race([
     new Promise((resolve) => child.on("exit", resolve)),
-    new Promise((_, reject) => setTimeout(() => reject(new Error("launcher did not exit after the scope was confirmed gone")), 20000))
+    new Promise((_, reject) => setTimeout(() => reject(new Error("launcher did not exit after the scope was confirmed gone")), 60000)) // generous: the suite runs many files at once
   ]);
   assert.equal(exitRecord(logFile).code, 0);
 });

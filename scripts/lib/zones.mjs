@@ -15,8 +15,15 @@ function lower(text) {
   return process.platform === "win32" ? text.toLowerCase() : text;
 }
 
+// Only regular files and directories belong in a zone: FIFOs, sockets, devices and anything else are
+// rejected (a socket in the zone would let a worker talk to a service outside the sandbox).
+export function isSpecialEntry(entry) {
+  return !entry.isSymbolicLink() && !entry.isFile() && !entry.isDirectory();
+}
+
 // Walks the zone. Fail-closed: anything that cannot be inspected rejects the zone, because the sandbox can
-// only confine what we know about. Symlinks/junctions (reparse points) and hard-linked files are rejected.
+// only confine what we know about. Symlinks/junctions (reparse points), hard-linked files and special files
+// are rejected.
 function walk(root) {
   const stack = [root];
   let seen = 0;
@@ -33,6 +40,7 @@ function walk(root) {
       if (seen > WALK_LIMIT) throw bad(`Zone has more than ${WALK_LIMIT} entries: ${root}`, "Choose a smaller zone.");
       const full = path.join(dir, entry.name);
       if (entry.isSymbolicLink()) throw bad(`Zone contains a symlink or junction: ${full}`, "Remove it or choose another zone.");
+      if (isSpecialEntry(entry)) throw bad(`Zone contains a special file (FIFO, socket or device): ${full}`, "A worker could reach a service outside the sandbox through it. Remove it or choose another zone.");
       if (entry.isFile()) {
         // A hard link shares its data with a path outside the zone: the sandbox cannot confine that.
         let links;

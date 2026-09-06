@@ -70,16 +70,39 @@ export async function spawnDetachedCodex({ args, stdinFile, logFile, cwd, confin
   return { pid: child.pid };
 }
 
-function readLogText(logPath) {
+// Worker logs are unbounded (codex plus every acceptance test writes into them). Everything the runner needs
+// sits at the head (thread.started) and at the tail (final message, turn.completed, tandem.exit), so only a
+// bounded window is ever read: the first 64 KB and the last 2 MB. A line cut at the window edge is not
+// valid JSON and is skipped by parseJsonl.
+export const LOG_HEAD_BYTES = 64 * 1024;
+export const LOG_TAIL_BYTES = 2 * 1024 * 1024;
+
+export function readLogWindow(logPath) {
+  let fd;
   try {
-    return fs.readFileSync(logPath, "utf8");
+    fd = fs.openSync(logPath, "r");
+    const size = fs.fstatSync(fd).size;
+    if (size <= LOG_HEAD_BYTES + LOG_TAIL_BYTES) return fs.readFileSync(fd, "utf8");
+    const head = Buffer.alloc(LOG_HEAD_BYTES);
+    fs.readSync(fd, head, 0, LOG_HEAD_BYTES, 0);
+    const tail = Buffer.alloc(LOG_TAIL_BYTES);
+    fs.readSync(fd, tail, 0, LOG_TAIL_BYTES, size - LOG_TAIL_BYTES);
+    return `${head.toString("utf8")}\n[tandem: ${size - LOG_HEAD_BYTES - LOG_TAIL_BYTES} bytes of the log skipped]\n${tail.toString("utf8")}`;
   } catch {
     return "";
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
   }
 }
 
+// One read and one parse per worker and refresh; the result is handed down to everything that needs it.
+export function loadLog(worker) {
+  const text = readLogWindow(worker.logPath);
+  return { text, events: parseJsonl(text) };
+}
+
 function workerEvents(worker) {
-  return parseJsonl(readLogText(worker.logPath));
+  return loadLog(worker).events;
 }
 
 // The launcher's exit record, or null when the log has none (launcher killed from outside, log truncated).
@@ -148,17 +171,16 @@ function abandonLaunch(worker) {
 }
 
 // Usage from the log: JSONL events first, `tokens used` stderr line as fallback. Booked once, after exit.
-export function bookWorkerUsage(state, worker) {
+export function bookWorkerUsage(state, worker, log = loadLog(worker)) {
   if (worker.usageBooked) return;
-  const text = readLogText(worker.logPath);
-  const usage = extractUsage({ events: parseJsonl(text), stderr: text });
+  const usage = extractUsage({ events: log.events, stderr: log.text });
   if (usage) addUsage(state, "worker", usage);
   worker.usageBooked = true;
 }
 
-function finish(state, worker, status, now, extra = {}) {
+function finish(state, worker, status, now, extra = {}, log = loadLog(worker)) {
   Object.assign(worker, { status, finishedAt: new Date(now).toISOString(), ...extra });
-  bookWorkerUsage(state, worker);
+  bookWorkerUsage(state, worker, log);
 }
 
 // The systemd scope a worker runs in (Linux confinement), or null. Taken from the launcher's marker, else
@@ -211,8 +233,8 @@ export function killWorker(worker, env = process.env) {
 // JSON report only. Budget-checked like every model call; a budget refusal leaves the retry pending (it is
 // attempted again on the next refresh), a model failure ends the worker with that failure and the usual
 // quota policy. Returns { parsed, errors, pending?, failure? }.
-async function retryWorkerResult(state, worker, { project, layout, env }) {
-  const threadId = threadIdFromEvents(workerEvents(worker));
+async function retryWorkerResult(state, worker, { project, layout, env }, log = loadLog(worker)) {
+  const threadId = threadIdFromEvents(log.events);
   if (!threadId) {
     worker.retried = true;
     return { parsed: null, errors: ["no thread id in the worker log; cannot resume"] };
@@ -239,26 +261,26 @@ async function retryWorkerResult(state, worker, { project, layout, env }) {
 
 // The retry is a model call: while tandem is paused or stopped it rests as `retry_pending`, exactly like a
 // retry the budget guard refused. The finished run's usage is booked either way.
-async function settleResult(state, worker, { project, layout, env, now }) {
-  const found = readWorkerResult(worker);
+async function settleResult(state, worker, { project, layout, env, now }, log = loadLog(worker)) {
+  const found = readWorkerResult(worker, log.events);
   let outcome = found
     ? { ...parseReplyText(found.raw, "worker-result"), source: found.source }
     : { parsed: null, errors: [`reply file missing: ${worker.resultPath}`], source: null };
   if (!outcome.parsed && !worker.retried) {
     outcome = state.paused || state.stopped
       ? { parsed: null, errors: [...outcome.errors, "retry pending: tandem is paused or stopped"], pending: true }
-      : await retryWorkerResult(state, worker, { project, layout, env });
+      : await retryWorkerResult(state, worker, { project, layout, env }, log);
   }
   if (outcome.parsed) {
-    finish(state, worker, outcome.parsed.status.toLowerCase(), now, { result: outcome.parsed, resultSource: outcome.source });
+    finish(state, worker, outcome.parsed.status.toLowerCase(), now, { result: outcome.parsed, resultSource: outcome.source }, log);
   } else if (outcome.pending) {
     worker.status = "retry_pending"; // not terminal, zone free; retried on the next refresh
     worker.retryErrors = outcome.errors;
-    bookWorkerUsage(state, worker); // the original run is over; its tokens count now, not after the retry
+    bookWorkerUsage(state, worker, log); // the original run is over; its tokens count now, not after the retry
   } else if (outcome.failure) {
-    finish(state, worker, "failed", now, { failure: outcome.failure, errors: outcome.errors });
+    finish(state, worker, "failed", now, { failure: outcome.failure, errors: outcome.errors }, log);
   } else {
-    finish(state, worker, "invalid_output", now, { errors: outcome.errors });
+    finish(state, worker, "invalid_output", now, { errors: outcome.errors }, log);
   }
 }
 
@@ -273,25 +295,25 @@ function recordExit(worker, events) {
 // The process is gone: a complete report (file or log) is the result, whatever the caller intended;
 // otherwise the worker ends with `fallback` (orphaned/failed classification, a kill reason, …).
 async function settleGone(state, worker, ctx, fallback) {
-  const events = workerEvents(worker);
-  const exit = recordExit(worker, events);
-  if (readWorkerResult(worker, events)) {
-    await settleResult(state, worker, ctx);
+  const log = loadLog(worker); // the one read of this worker's log for this refresh
+  const exit = recordExit(worker, log.events);
+  if (readWorkerResult(worker, log.events)) {
+    await settleResult(state, worker, ctx, log);
     return;
   }
-  fallback(exit);
+  fallback(exit, log);
 }
 
-function orphanOrFail(state, worker, now, exit) {
+function orphanOrFail(state, worker, now, exit, log) {
   // The launcher could not start codex at all (marker not writable, binary missing, job setup failed).
   if (exit?.error) {
-    finish(state, worker, "failed", now, { failure: "spawn_failed", errors: [exit.error] });
+    finish(state, worker, "failed", now, { failure: "spawn_failed", errors: [exit.error] }, log);
     return;
   }
   // Exit code 0 without any report is "no_result"; a missing exit record (launcher killed) counts as 1.
-  const failure = classifyFailure({ status: exit?.code ?? 1, timedOut: false, stderr: readLogText(worker.logPath) }) ?? "no_result";
+  const failure = classifyFailure({ status: exit?.code ?? 1, timedOut: false, stderr: log.text }) ?? "no_result";
   if (failure === "quota") state.paused = true;
-  finish(state, worker, FAILED_CLASSES.has(failure) ? "failed" : "orphaned", now, { failure });
+  finish(state, worker, FAILED_CLASSES.has(failure) ? "failed" : "orphaned", now, { failure }, log);
 }
 
 // A record without a persisted pid (the runner died between reserving the record and saving the pid):
@@ -366,7 +388,7 @@ export async function refreshWorkers(state, { project, layout, now = Date.now(),
           continue;
         }
       }
-      await settleGone(state, worker, ctx, () => finish(state, worker, worker.killReason, now, { killFailed: false }));
+      await settleGone(state, worker, ctx, (exit, log) => finish(state, worker, worker.killReason, now, { killFailed: false }, log));
       changed = true;
       continue;
     }
@@ -376,14 +398,14 @@ export async function refreshWorkers(state, { project, layout, now = Date.now(),
         changed = true;
       } else if (now > Date.parse(worker.deadlineAt)) {
         const kill = killWorker(worker, env);
-        if (kill.gone) await settleGone(state, worker, ctx, () => finish(state, worker, "timeout", now, { killReason: "timeout" }));
+        if (kill.gone) await settleGone(state, worker, ctx, (exit, log) => finish(state, worker, "timeout", now, { killReason: "timeout" }, log));
         else Object.assign(worker, { status: "killing", killReason: "timeout", killFailed: true, killBlockedBy: kill.reason ?? "kill_failed" });
         changed = true;
       }
       continue;
     }
     // Process gone: the -o file or, failing that, the final message in the log is the report.
-    await settleGone(state, worker, ctx, (exit) => orphanOrFail(state, worker, now, exit));
+    await settleGone(state, worker, ctx, (exit, log) => orphanOrFail(state, worker, now, exit, log));
     changed = true;
   }
   return changed;
@@ -403,7 +425,7 @@ export async function cancelWorker(state, worker, { project, layout, env = proce
     Object.assign(worker, { status: "killing", killReason: "cancelled", killFailed: true, killBlockedBy: kill.reason ?? "kill_failed" });
     return { gone: false, changed: true };
   }
-  await settleGone(state, worker, ctx, () => finish(state, worker, "cancelled", now, { killReason: "cancelled", killFailed: false }));
+  await settleGone(state, worker, ctx, (exit, log) => finish(state, worker, "cancelled", now, { killReason: "cancelled", killFailed: false }, log));
   return { gone: true, changed: true };
 }
 

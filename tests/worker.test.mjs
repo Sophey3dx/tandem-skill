@@ -614,3 +614,26 @@ test("systemd scope: a worker stays alive until its scope is confirmed gone, eve
   assert.equal(done.json.workers[0].status, "done", JSON.stringify(done.json.workers[0]));
   assert.equal(done.json.active, 0);
 });
+
+test("a huge worker log is read as a bounded window, once, and still yields thread id, report and exit code", async () => {
+  const { loadLog, readWorkerResult, LOG_HEAD_BYTES, LOG_TAIL_BYTES } = await import("../scripts/lib/workers.mjs");
+  const { threadIdFromEvents } = await import("../scripts/lib/codex.mjs");
+  const dir = makeProject("worker-biglog");
+  const logPath = path.join(dir, "log.txt");
+  const report = JSON.stringify({ status: "DONE", touchedFiles: ["a.txt"], tests: [], remaining: [], blockers: [], notes: "big" });
+  const fd = fs.openSync(logPath, "w");
+  fs.writeSync(fd, `${JSON.stringify({ type: "thread.started", thread_id: "thread-big" })}\n`);
+  const filler = `${"x".repeat(1023)}\n`;
+  for (let written = 0; written < 5 * 1024 * 1024; written += filler.length) fs.writeSync(fd, filler);
+  fs.writeSync(fd, `${JSON.stringify({ type: "item.completed", item: { id: "i", type: "agent_message", text: report } })}\n`);
+  fs.writeSync(fd, `${JSON.stringify({ type: "turn.completed", usage: { input_tokens: 5, output_tokens: 1 } })}\n`);
+  fs.writeSync(fd, `${JSON.stringify({ type: "tandem.exit", code: 0, signal: null })}\n`);
+  fs.closeSync(fd);
+  const worker = { logPath, resultPath: path.join(dir, "result.json") };
+  const log = loadLog(worker);
+  assert.ok(log.text.length <= LOG_HEAD_BYTES + LOG_TAIL_BYTES + 200, "only the head and the tail are read");
+  assert.match(log.text, /bytes of the log skipped/);
+  assert.equal(threadIdFromEvents(log.events), "thread-big", "the head still has the thread id");
+  assert.equal(readWorkerResult(worker, log.events).raw, report, "the tail still has the report");
+  assert.equal(log.events.at(-1).type, "tandem.exit");
+});

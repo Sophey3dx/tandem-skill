@@ -111,3 +111,31 @@ test("hard-linked files inside the zone are rejected (their data also lives outs
   fs.unlinkSync(path.join(zone, "alias.txt"));
   same(checkZone({ project, zone }), zone); // a single link is an ordinary file again
 });
+
+test("special files (FIFO, socket, device) are rejected; only regular files and directories pass", async () => {
+  const { isSpecialEntry } = await import("../scripts/lib/zones.mjs");
+  const fake = (kind) => ({ isSymbolicLink: () => kind === "link", isFile: () => kind === "file", isDirectory: () => kind === "dir" });
+  assert.equal(isSpecialEntry(fake("file")), false);
+  assert.equal(isSpecialEntry(fake("dir")), false);
+  assert.equal(isSpecialEntry(fake("link")), false, "links are handled (rejected) by their own rule");
+  assert.equal(isSpecialEntry(fake("fifo")), true);
+  assert.equal(isSpecialEntry(fake("socket")), true);
+});
+
+test("a FIFO or a socket inside the zone rejects it", { skip: process.platform === "win32" }, async () => {
+  const { spawnSync } = await import("node:child_process");
+  const net = await import("node:net");
+  const project = makeProject("zone-special");
+  const zone = zoneIn(project, "src/special");
+  const fifo = path.join(zone, "pipe");
+  assert.equal(spawnSync("mkfifo", [fifo]).status, 0);
+  assert.equal(code(() => checkZone({ project, zone })), "bad_zone");
+  fs.unlinkSync(fifo);
+  const server = net.createServer();
+  await new Promise((resolve) => server.listen(path.join(zone, "svc.sock"), resolve));
+  try {
+    assert.equal(code(() => checkZone({ project, zone })), "bad_zone");
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});

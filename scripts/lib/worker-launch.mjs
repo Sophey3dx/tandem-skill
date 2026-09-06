@@ -27,7 +27,7 @@ import { fileURLToPath } from "node:url";
 import { ensureScopeGone, systemdRunCommand } from "./confinement.mjs";
 
 const JOB_SCRIPT = fileURLToPath(new URL("./win-job-run.ps1", import.meta.url));
-const SENTINEL_RETRY_MS = 5000;
+const SENTINEL_RETRY_MS = 2000;
 const [logFile, cmd, ...args] = process.argv.slice(2);
 if (!logFile || !cmd) {
   process.stderr.write("usage: worker-launch.mjs <logFile> <cmd> [args...]\n");
@@ -64,7 +64,7 @@ function mark(extra = {}, { exclusive = false } = {}) {
 function confirmScopeGone() {
   if (!scopeUnit) return;
   let announced = false;
-  while (!ensureScopeGone(scopeUnit, { attempts: 6, waitMs: 500 })) {
+  while (!ensureScopeGone(scopeUnit, { attempts: 3, waitMs: 500 })) {
     if (!announced) {
       note(`scope ${scopeUnit}.scope could not be confirmed gone; staying alive as a sentinel until it is`);
       announced = true;

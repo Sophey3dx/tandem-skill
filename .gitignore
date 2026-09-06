@@ -2,3 +2,4 @@ node_modules/
 .duofold/
 *.log
 .DS_Store
+tests/.tmp/

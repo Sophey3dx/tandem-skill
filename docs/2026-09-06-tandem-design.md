@@ -45,6 +45,8 @@ Nächster Schritt: Implementierungsplan (`superpowers:writing-plans`).
 | 9 | Liegt das Projekt unter `%TEMP%`, ist alles beschreibbar (workspace-write erlaubt cwd + /tmp + $TMPDIR). | Runner lehnt Zonen in TEMP/TMP ab. |
 | 10 | Großer Prompt als Positional-Argument blockiert unter PowerShell (bekannter Duofold-Kniff). | Prompts **immer** per stdin bzw. Datei. |
 | 11 | Nutzer-Config: `model = gpt-5.6-sol`, `model_reasoning_effort = high`, `personality = pragmatic`. | Modell nicht überschreiben, Effort je Kontakt-Typ. |
+| 12 | `codex app-server` (stdio, JSON-RPC) beantwortet nach `initialize` die Anfrage `account/rateLimits/read` **ohne Modellaufruf** mit `primary` (5-h-Fenster) und `secondary` (Wochenfenster), je `usedPercent`, `windowDurationMins`, `resetsAt` (Unix-Sekunden), dazu `planType` und `rateLimitReachedType`. | Nutzungs-Wächter: Restnutzung vor jedem Aufruf prüfen. |
+| 13 | `codex login status` gibt bei Login Exit 0 („Logged in using ChatGPT"). npm-Shim `codex.cmd` startet `node <npm>\node_modules\@openai\codex\bin\codex.js`; JSONL-Events: `thread.started{thread_id}`, `turn.started`, `item.completed{item.type=agent_message,text}`, `turn.completed{usage{input_tokens,cached_input_tokens,cache_write_input_tokens,output_tokens,reasoning_output_tokens}}`. | `doctor`, Binary-Auflösung ohne cmd.exe-Quoting, Usage aus Events. |
 
 ---
 
@@ -69,6 +71,7 @@ Ein Node-Skript **ohne Abhängigkeiten** (Node ≥ 18, wie das OpenAI-Plugin). C
 - Fehlererkennung (nicht resumierbar, Limit, ungültige Antwort) mit definiertem Fallback,
 - Design-Runden (Ordner, Vite-Einstieg, Entscheidung, Cleanup) und den Tandem-Server mit Galerie und Board (4.6, 4.7),
 - **Kosten-Zähler:** Token-Verbrauch je Codex-Lauf aus dem JSONL-Event `turn.completed` (Feld `usage`; Fallback: die `tokens used`-Zeile auf stderr, locale-bewusst geparst, z. B. `57.717` unter de-DE) in `state.usage` summieren (gesamt, je Kontakt-Art, je Session) und in `status` ausgeben,
+- **Nutzungs-Wächter:** vor **jedem** Codex-Lauf liest der Runner die Restnutzung über `codex app-server` (`account/rateLimits/read`, kein Modellaufruf, etwa eine Sekunde): 5-h-Fenster und Wochenfenster als Rest in Prozent plus Reset-Zeitpunkt. Liegt ein Fenster unter der Schwelle (Standard 10 %, dauerhaft per `config --min-remaining <n>`, je Aufruf per `--min-remaining <n>`, `0` erzwingt), bricht der Runner mit `quota_low` ab, ruft Codex nicht auf und nennt Fenster und Reset-Zeit. Schlägt die Abfrage fehl, läuft der Aufruf trotzdem und `status` zeigt „Restnutzung unbekannt". Werte werden in `state.rateLimits` gecacht und in `status`, `doctor` und Board angezeigt,
 - Codex-Verfügbarkeit/-Version (`doctor`).
 
 Ausgabe des Runners: immer **eine JSON-Zeile** auf stdout (`{ok, …}`), Fehler mit `ok:false, error, hint`. Exitcode 0 bei ok, 1 sonst. Menschlich lesbare Zusammenfassung optional mit `--human`.
@@ -214,6 +217,7 @@ Eine **read-only Zeitleiste** des Austauschs zwischen Claude und Codex im Browse
 | `design status` | `[--round N]` | Runden, Varianten vorhanden ja/nein, Worker-Status, Server-URL |
 | `design finish` | `--round N` `--pick claude\|codex\|mix` `[--note <text>]` `[--cleanup]` | `decision.json` schreiben; `--cleanup` entfernt Vite-Lab-Dateien |
 | `mode <m>` / `pause` / `unpause` / `stop` | — | Zustand setzen |
+| `config` | `--min-remaining <prozent>` | Schwelle des Nutzungs-Wächters dauerhaft setzen (Standard 10) |
 | `rotate` | `--seed-file <abs>` | neuer Thread, alter in History |
 | `status` | `[--human]` | Zustandszusammenfassung inkl. Token-Verbrauch (gesamt, je Art, diese Session) und Server-URL |
 
@@ -226,7 +230,8 @@ Alle Befehle: `--project <abs>` optional (default: cwd), Ausgabe eine JSON-Zeile
 | Fall | Erkennung | Fallback |
 |------|-----------|----------|
 | Thread nicht resumierbar (Codex-Update, Session gelöscht) | Exit ≠ 0 + Fehlertext des Resume | Runner meldet `error: thread_lost`; Claude schreibt Seed aus Ledger, `rotate`; Vermerk im Ledger |
-| Limit/Quota erreicht | Fehlertext (Rate-Limit/Usage-Limit) in stderr/JSONL | `state.paused = true`, `error: quota`; Claude informiert den Nutzer, arbeitet ohne Checkpoints weiter, Ledger „degradiert seit …" |
+| Restnutzung unter Schwelle | Vorab-Abfrage `account/rateLimits/read` vor jedem Lauf | `error: quota_low` mit Fenster, Rest-Prozent und Reset-Zeit; **kein** Codex-Aufruf, keine Pause (nach dem Reset geht es automatisch weiter); Claude informiert den Nutzer und arbeitet ohne Kontakt weiter oder wartet; `--min-remaining 0` erzwingt |
+| Limit/Quota erreicht (trotz Wächter) | Fehlertext (Rate-Limit/Usage-Limit) in stderr/JSONL | `state.paused = true`, `error: quota`; Claude informiert den Nutzer, arbeitet ohne Checkpoints weiter, Ledger „degradiert seit …" |
 | Hängender Prozess | Deadline je Kontakt-Typ überschritten | Prozessbaum beenden, Kontakt „timeout"; bei Workern Diff prüfen; **ein** manueller Neuversuch, nie blind wiederholen |
 | Ungültige Antwort trotz Schema | Runner-Validierung | ein Wiederholungsversuch mit Schema-Hinweis, sonst „failed" |
 | Codex-Version gewechselt | `doctor`/`start`/`contact` vergleicht mit `state.codexVersion` | Vermerk + Smoke-Kontakt (Effort low) |
@@ -253,7 +258,7 @@ Der Runner wiederholt **nie** selbstständig Codex-Aufrufe (Kosten). Jeder Fehle
 | Design-Kritik (Sparring) | low | 5 min |
 | Abschluss-Review | medium; high bei Security/Daten/Concurrency | 15 min |
 
-Jeder Prompt enthält einen **Output-Cap** (max. Punkte, max. Zeilen). Die Anzahl der Kontakte hält Claude klein: nur Protokoll-Checkpoints, keine Kontakte für Einzeiler, Typos oder Renames. Der **Kosten-Zähler** (3.2) macht den Verbrauch sichtbar: `status` und Board zeigen Tokens gesamt, je Kontakt-Art und für die laufende Session; Claude nennt den Stand im Abschluss-Bericht.
+Jeder Prompt enthält einen **Output-Cap** (max. Punkte, max. Zeilen). Die Anzahl der Kontakte hält Claude klein: nur Protokoll-Checkpoints, keine Kontakte für Einzeiler, Typos oder Renames. Der **Kosten-Zähler** (3.2) macht den Verbrauch sichtbar: `status` und Board zeigen Tokens gesamt, je Kontakt-Art und für die laufende Session; Claude nennt den Stand im Abschluss-Bericht. Der **Nutzungs-Wächter** (3.2) zeigt die Restnutzung beider Fenster und verhindert Aufrufe unter der Schwelle; Claude nennt die Restnutzung bei `/tandem status` und immer, wenn ein Kontakt daran scheitert.
 
 ---
 
@@ -276,8 +281,9 @@ Jeder Prompt enthält einen **Output-Cap** (max. Punkte, max. Zeilen). Die Anzah
   SKILL.md                          Trigger, Modi, Protokoll, Regeln (Deutsch, Stil wie duofold)
   README.md / README.de.md          Kurzdoku für GitHub
   references/
-    contracts.md                    Prompt-Verträge: Onboarding, Kontakt-Umschlag, Resume, Plan-Runde (R1 / R2+ mit Matrix),
+    contracts.md                    Prompt-Verträge in Prosa (für Claude): Onboarding, Kontakt-Umschlag, Resume, Plan-Runde (R1 / R2+ mit Matrix),
                                     Sparring, Lane, Worker-Handover, Abschluss, Rotations-Seed
+    templates/*.md                  Maschinen-Vorlagen dazu, eine Datei je Vertrag, Platzhalter {{NAME}}; lib/prompts.mjs lädt diese Dateien
     schemas/verdict.schema.json
     schemas/plan-verdict.schema.json
     schemas/worker-result.schema.json
@@ -291,9 +297,11 @@ Jeder Prompt enthält einen **Output-Cap** (max. Punkte, max. Zeilen). Die Anzah
     lib/zones.mjs                   Zonen-Prüfungen (TEMP, Verschachtelung, Reparse Points, verbotene Ordner)
     lib/schema.mjs                  Laden der Schemas, Minimal-Validierung (required, enum, type)
     lib/workers.mjs                 detached Start, PID/Deadline, wait, cancel, orphan-Erkennung
-    lib/prompts.mjs                 Vorlagen aus contracts.md laden, Platzhalter füllen
+    lib/prompts.mjs                 Vorlagen aus references/templates/ laden, Platzhalter füllen
     lib/design.mjs                  Design-Runden: Ordner, Vite-Erkennung, Lab-Einstieg scaffolden, decision.json, cleanup
     lib/usage.mjs                   Token-Verbrauch aus JSONL/stderr lesen, in state.usage summieren
+    lib/ratelimits.mjs              Restnutzung über `codex app-server` (account/rateLimits/read) lesen, Schwelle prüfen (quota_low)
+    lib/exchange.mjs                gemeinsamer Ablauf eines Thread-Kontakts: Wächter, Resume-Aufruf, Schema-Prüfung, ein Retry, Zustand
     lib/server.mjs                  Tandem-Server (http, localhost): /board, /board.json, /design, /design/<N>, /files, Traversal-Schutz, Deadline
     lib/board.mjs                   Board-Daten aus .tandem/ sammeln (Kontakte, Planrunden, Worker, Design, Einwände aus ledger.md)
   references/templates/
@@ -327,6 +335,7 @@ Jeder Prompt enthält einen **Output-Cap** (max. Punkte, max. Zeilen). Die Anzah
   - Tandem-Server: liefert Galerie-Index und Rundenseite, blockt `..`-Pfade, setzt Content-Types, bindet nur an localhost, `serve stop` beendet den Prozess.
   - Board: `/board.json` bildet Kontakte, Planrunden, Worker, Design-Runden und Ledger-Einwände korrekt ab (Fixture-`.tandem/`); `/board` rendert ohne externe Ressourcen.
   - Kosten-Zähler: `turn.completed`-Usage wird summiert; stderr-Fallback parst `57.717` (de-DE) und `57,717` (en-US) beide zu 57717.
+  - Nutzungs-Wächter: Fake-App-Server liefert einstellbare `usedPercent`; unter der Schwelle bricht `contact` mit `quota_low` ab, ohne den Fake-`exec` aufzurufen; `--min-remaining 0` erzwingt; Abfragefehler blockiert nicht.
 - **Smoke** gegen echtes Codex (Effort low), nur auf Zuruf: `start` → `contact` → `lane` → `review` in einem Wegwerf-Projekt außerhalb von TEMP.
 - **Skill-Probelauf** vor „fertig": ein kleines echtes Feature in einem Beispielprojekt durch Start, Checkpoint, Planrunde, Worker, Abschluss.
 
@@ -380,6 +389,7 @@ Jeder Prompt enthält einen **Output-Cap** (max. Punkte, max. Zeilen). Die Anzah
 - Abschnitte 1–3 des Designs freigegeben.
 - Design-Galerie in v1: Standalone-Galerie **und** Vite-Route (Idee des Nutzers: „kleiner Vite-Server, um sich verschiedene Designs von euch beiden anzuschauen").
 - Kosten-Zähler und Tandem-Board in v1 (Vorschlag Claude, Nutzer: „passt").
+- Nutzungs-Wächter in v1 (Frage des Nutzers: Restnutzung sehen und bei 0 % nicht mehr auf Codex zugreifen); `account/rateLimits/read` am 2026-09-06 verifiziert.
 - Spec freigegeben; nächster Schritt writing-plans, danach Duofold-Prüfung des Plans.
 
 **Codex-Review (Duofold, Modus idee, Standard), eingearbeitet**

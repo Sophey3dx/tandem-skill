@@ -46,6 +46,22 @@ test("REVISE yields no consensus; round 2 needs the matrix and medium effort", (
   assert.ok(call.stdin.includes("P1-1 → accepted"));
 });
 
+test("from round 2 on, blocking points without newEvidence are rejected; with evidence they pass", () => {
+  const { dir, plan, matrix } = prepared("plan-evidence");
+  assert.equal(runTandem(["plan-round", "--round", "1", "--plan-file", plan], { cwd: dir, env: { FAKE_PLAN_VERDICT: "REVISE" } }).json.consensus, false);
+  const noEvidence = runTandem(["plan-round", "--round", "2", "--plan-file", plan, "--matrix-file", matrix], { cwd: dir, env: { FAKE_PLAN_VERDICT: "REVISE", FAKE_PLAN_NO_EVIDENCE: "1" } });
+  assert.equal(noEvidence.json.error, "invalid_output");
+  assert.match(noEvidence.json.message, /newEvidence/);
+  const state = JSON.parse(fs.readFileSync(path.join(dir, ".tandem", "state.json"), "utf8"));
+  assert.equal(state.plan.round, 1, "invalid round 2 must not advance");
+  const withEvidence = runTandem(["plan-round", "--round", "2", "--plan-file", plan, "--matrix-file", matrix], { cwd: dir, env: { FAKE_PLAN_VERDICT: "REVISE" } });
+  assert.equal(withEvidence.json.ok, true);
+  assert.equal(withEvidence.json.verdict.points[0].newEvidence, "wie P1-1, unverändert");
+  assert.equal(withEvidence.json.consensus, false);
+  const after = JSON.parse(fs.readFileSync(path.join(dir, ".tandem", "state.json"), "utf8"));
+  assert.deepEqual(after.plan.verdicts.at(-1).pointIds, ["P2-1:MAJOR"]);
+});
+
 test("round order is enforced and round 4 is rejected", () => {
   const { dir, plan, matrix } = prepared("plan3");
   assert.equal(runTandem(["plan-round", "--round", "2", "--plan-file", plan, "--matrix-file", matrix], { cwd: dir }).json.error, "round_order");

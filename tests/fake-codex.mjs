@@ -41,11 +41,14 @@ function sampleFor(schema, stdin) {
   const verdictEnum = schema.properties?.verdict?.enum ?? [];
   if (verdictEnum.includes("APPROVE")) {
     const verdict = process.env.FAKE_PLAN_VERDICT ?? "APPROVE";
+    const round = Number(/Planrunde (\d) von 3/.exec(stdin)?.[1] ?? 1);
+    // From round 2 on the contract demands newEvidence on blocking points; FAKE_PLAN_NO_EVIDENCE=1 omits it.
+    const newEvidence = round >= 2 && process.env.FAKE_PLAN_NO_EVIDENCE !== "1" ? "wie P1-1, unverändert" : null;
     return {
       verdict,
       checked: ["plan.md"],
       criteria: { blockersOpen: verdict === "APPROVE" ? 0 : 1, sourcesRead: true, testStrategyFeasible: true, residualRisk: process.env.FAKE_PLAN_RISK ?? "gering" },
-      points: verdict === "APPROVE" ? [] : [{ id: `${prefix}-1`, severity: "MAJOR", category: "correctness", text: "fake objection", section: "Task 1", newEvidence: null }]
+      points: verdict === "APPROVE" ? [] : [{ id: `${prefix}-1`, severity: "MAJOR", category: "correctness", text: "fake objection", section: "Task 1", newEvidence }]
     };
   }
   if (verdictEnum.includes("OK")) {

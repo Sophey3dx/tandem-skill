@@ -48,7 +48,7 @@ export function retryPromptFile(layout, base, schema, errors) {
   return file;
 }
 
-export async function runWithSchema({ state, project, layout, base, n, contactId, promptFile, schema, effort, deadlineMs, outFile, kind, idPrefix, options = {} }) {
+export async function runWithSchema({ state, project, layout, base, n, contactId, promptFile, schema, effort, deadlineMs, outFile, kind, idPrefix, round, options = {} }) {
   const args = buildResumeArgs({ threadId: state.threadId, effort, schemaPath: schemaPath(schema), outFile });
   let attempts = 0;
   let result = null;
@@ -72,7 +72,7 @@ export async function runWithSchema({ state, project, layout, base, n, contactId
       saveState(project, state);
       throw failureToError(result, kind);
     }
-    ({ parsed, errors } = parseReplyFile(outFile, schema, { idPrefix }));
+    ({ parsed, errors } = parseReplyFile(outFile, schema, { idPrefix, round }));
     if (parsed) break;
     currentPrompt = retryPromptFile(layout, base, schema, errors);
   }

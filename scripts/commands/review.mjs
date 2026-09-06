@@ -16,6 +16,10 @@ import { extractUsage } from "../lib/usage.mjs";
 // exactly one retry by resuming that review thread, like contacts and plan rounds.
 
 function describeTarget(options) {
+  const chosen = ["base", "commit", "uncommitted"].filter((key) => options[key] !== undefined && options[key] !== false);
+  if (chosen.length > 1) {
+    throw new TandemError("bad_target", `Use exactly one of --uncommitted, --base <ref>, --commit <sha> (got ${chosen.map((k) => `--${k}`).join(", ")}).`);
+  }
   if (options.base) return { flag: ["--base", String(options.base)], label: `Branch gegen ${options.base}`, diffCommand: `git diff ${options.base}...HEAD`, statArgs: ["diff", "--stat", `${options.base}...HEAD`] };
   if (options.commit) return { flag: ["--commit", String(options.commit)], label: `Commit ${options.commit}`, diffCommand: `git show ${options.commit}`, statArgs: ["show", "--stat", "--format=%h %s", String(options.commit)] };
   return { flag: ["--uncommitted"], label: "uncommittete Änderungen", diffCommand: "git status --short --untracked-files=all && git diff && git diff --cached", statArgs: ["diff", "--stat", "HEAD"] };

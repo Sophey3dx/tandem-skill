@@ -44,6 +44,21 @@ test("runCodex pipes the prompt file via stdin and parses JSONL events", async (
   assert.ok(calls[0].argv.includes("--skip-git-repo-check"));
 });
 
+test("runCodex refuses to spawn when the prompt file is missing or empty", async () => {
+  const dir = makeProject("noprompt");
+  const logFile = path.join(dir, "fake.log");
+  await assert.rejects(
+    runCodex({ args: ["exec", "-"], promptFile: path.join(dir, "missing.md"), cwd: dir, timeoutMs: 5000, env: env({ FAKE_CODEX_LOG: logFile }) }),
+    (e) => e.code === "prompt_unreadable"
+  );
+  const empty = writeFile(dir, "empty.md", "   \n");
+  await assert.rejects(
+    runCodex({ args: ["exec", "-"], promptFile: empty, cwd: dir, timeoutMs: 5000, env: env({ FAKE_CODEX_LOG: logFile }) }),
+    (e) => e.code === "prompt_empty"
+  );
+  assert.equal(readLog(logFile).length, 0, "no codex process was started");
+});
+
 test("runCodex kills a hanging process after the deadline", async () => {
   const dir = makeProject("hang");
   const prompt = writeFile(dir, "prompt.md", "x");

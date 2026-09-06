@@ -87,6 +87,35 @@ test("a held lock is refreshed by the heartbeat so it never ages into stale whil
   assert.equal(fs.existsSync(lockFile), false);
 });
 
+test("the heartbeat never leaves the lock unreadable (atomic rewrite), so a concurrent acquire always sees it held", async () => {
+  const dir = project();
+  const { lockFile } = tandemLayout(dir);
+  const stateUrl = new URL("../scripts/lib/state.mjs", import.meta.url).href;
+  const script = `import { acquireLock } from ${JSON.stringify(stateUrl)}; const release = acquireLock(process.argv[1]); setTimeout(() => { release(); }, 1500);`;
+  const child = spawn(process.execPath, ["--input-type=module", "-e", script, dir], { stdio: "ignore", env: { ...process.env, TANDEM_LOCK_HEARTBEAT_MS: "2" } });
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  let unreadable = 0;
+  let lockedRefusals = 0;
+  const until = Date.now() + 1000;
+  while (Date.now() < until) {
+    try {
+      JSON.parse(fs.readFileSync(lockFile, "utf8"));
+    } catch {
+      unreadable += 1;
+    }
+    try {
+      acquireLock(dir)();
+      break; // acquiring here would mean the held lock was treated as stale
+    } catch (error) {
+      if (error.code === "locked") lockedRefusals += 1;
+      else throw error;
+    }
+  }
+  await new Promise((resolve) => child.on("exit", resolve));
+  assert.equal(unreadable, 0, "lock file must always parse while held");
+  assert.ok(lockedRefusals > 10, `expected many refusals, got ${lockedRefusals}`);
+});
+
 test("acquireLock is atomic across processes", async () => {
   const dir = project();
   const stateUrl = new URL("../scripts/lib/state.mjs", import.meta.url).href;

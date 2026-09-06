@@ -82,7 +82,7 @@ export async function runPlanRound({ project, options }) {
     let exchange;
     try {
       exchange = await runWithSchema({
-        state, project, layout, base, n, contactId, promptFile: wrapped, schema: "plan-verdict", effort, deadlineMs, outFile, kind: "plan", idPrefix: `P${round}`, options
+        state, project, layout, base, n, contactId, promptFile: wrapped, schema: "plan-verdict", effort, deadlineMs, outFile, kind: "plan", idPrefix: `P${round}`, round, options
       });
     } catch (error) {
       discardArchives(staged);
@@ -96,7 +96,7 @@ export async function runPlanRound({ project, options }) {
       nextPlan.hash = hash;
       nextPlan.round = round;
       nextPlan.planFile = planFile;
-      nextPlan.verdicts.push({ round, hash, verdict: parsed.verdict, consensus: isConsensus(parsed), blockersOpen: parsed.criteria.blockersOpen, points: parsed.points.length, replyPath: outFile });
+      nextPlan.verdicts.push({ round, hash, verdict: parsed.verdict, consensus: isConsensus(parsed), blockersOpen: parsed.criteria.blockersOpen, points: parsed.points.length, pointIds: parsed.points.map((p) => `${p.id}:${p.severity}`), replyPath: outFile });
       state.plan = nextPlan;
     } else {
       discardArchives(staged);

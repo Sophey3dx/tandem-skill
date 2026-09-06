@@ -108,6 +108,19 @@ export function failureToError(result, kind) {
 export function runCodex({ args, promptFile = null, cwd, timeoutMs, env = process.env, logFile = null }) {
   const { cmd, prefix } = resolveCodex(env);
   const fullArgs = [...prefix, ...args];
+  // The prompt is read completely BEFORE anything is spawned: an unreadable prompt must never turn into a
+  // model call with empty input (that would spend budget without a contract).
+  let prompt = null;
+  if (promptFile) {
+    try {
+      prompt = fs.readFileSync(promptFile, "utf8");
+    } catch (error) {
+      return Promise.reject(new TandemError("prompt_unreadable", `Cannot read prompt file ${promptFile}: ${error.message}`, "Write the prompt file first and pass its absolute path."));
+    }
+    if (!prompt.trim()) {
+      return Promise.reject(new TandemError("prompt_empty", `Prompt file ${promptFile} is empty.`, "Write the contact envelope before calling the runner."));
+    }
+  }
   const started = Date.now();
   return new Promise((resolve) => {
     const child = spawn(cmd, fullArgs, { cwd, env, stdio: ["pipe", "pipe", "pipe"], ...SPAWN_OPTIONS });
@@ -159,13 +172,8 @@ export function runCodex({ args, promptFile = null, cwd, timeoutMs, env = proces
     };
     child.on("error", (error) => finish(null, error.message));
     child.on("close", (code) => finish(code));
-    if (promptFile) {
-      const stream = fs.createReadStream(promptFile);
-      stream.on("error", () => child.stdin.end());
-      stream.pipe(child.stdin);
-    } else {
-      child.stdin.end();
-    }
+    if (prompt !== null) child.stdin.end(prompt);
+    else child.stdin.end();
   });
 }
 

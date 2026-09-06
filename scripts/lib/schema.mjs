@@ -61,8 +61,9 @@ function escapeRegExp(text) {
 }
 
 // Consistency rules the schema alone cannot express: verdict vs. point severities, non-empty residual risk,
-// point ids in the contract's format. A violation counts as an invalid answer and triggers the one retry.
-export function semanticErrors(schemaName, value, { idPrefix } = {}) {
+// point ids in the contract's format, and from plan round 2 on evidence for every blocking point.
+// A violation counts as an invalid answer and triggers the one retry.
+export function semanticErrors(schemaName, value, { idPrefix, round } = {}) {
   const errors = [];
   const points = Array.isArray(value?.points) ? value.points : [];
   const severities = new Set(points.map((p) => p?.severity));
@@ -88,11 +89,18 @@ export function semanticErrors(schemaName, value, { idPrefix } = {}) {
     if (value?.verdict === "REVISE" && !worst && !(Number(value?.criteria?.blockersOpen) > 0)) {
       errors.push("$.verdict: REVISE requires a BLOCKER/MAJOR point or blockersOpen > 0 (MINOR never blocks)");
     }
+    if (Number(round) >= 2) {
+      points.forEach((p, index) => {
+        if ((p?.severity === "BLOCKER" || p?.severity === "MAJOR") && !String(p?.newEvidence ?? "").trim()) {
+          errors.push(`$.points[${index}].newEvidence: required for BLOCKER/MAJOR points from round 2 on (new evidence or a reference to the earlier point)`);
+        }
+      });
+    }
   }
   return errors;
 }
 
-export function parseReplyFile(file, schemaName, { idPrefix } = {}) {
+export function parseReplyFile(file, schemaName, { idPrefix, round } = {}) {
   if (!fs.existsSync(file)) return { parsed: null, errors: [`reply file missing: ${file}`], raw: null };
   const raw = fs.readFileSync(file, "utf8");
   let value;
@@ -104,6 +112,6 @@ export function parseReplyFile(file, schemaName, { idPrefix } = {}) {
   const errors = validate(loadSchema(schemaName), value);
   const cap = POINT_CAPS[schemaName];
   if (cap && Array.isArray(value?.points) && value.points.length > cap) errors.push(`$.points: more than ${cap} items`);
-  if (errors.length === 0) errors.push(...semanticErrors(schemaName, value, { idPrefix }));
+  if (errors.length === 0) errors.push(...semanticErrors(schemaName, value, { idPrefix, round }));
   return { parsed: errors.length === 0 ? value : null, errors, raw };
 }

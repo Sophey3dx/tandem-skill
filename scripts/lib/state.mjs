@@ -83,6 +83,27 @@ function readLock(lockFile) {
   }
 }
 
+// The lock file is never truncated in place: every write goes to a sibling temp file and is renamed over
+// the lock, so a concurrent reader always sees a complete JSON document.
+function writeLockAtomically(lockFile, payload) {
+  const tmp = `${lockFile}.${process.pid}.${Math.random().toString(16).slice(2, 8)}.tmp`;
+  fs.writeFileSync(tmp, payload, "utf8");
+  fs.renameSync(tmp, lockFile);
+}
+
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+// An unreadable lock (missing, empty, half-written) is re-read once after a short pause before it counts as
+// stale; only a lock that stays unreadable is treated as garbage.
+function inspectLock(lockFile) {
+  const first = readLock(lockFile);
+  if (first) return first;
+  sleepSync(50);
+  return readLock(lockFile);
+}
+
 function isStale(lock) {
   if (!lock) return true;
   const age = lock.at ? Date.now() - Date.parse(lock.at) : Number.POSITIVE_INFINITY;
@@ -107,7 +128,7 @@ export function acquireLock(projectRoot) {
       const heartbeat = setInterval(() => {
         if (readLock(lockFile)?.token !== token) return;
         try {
-          fs.writeFileSync(lockFile, payloadFor(), "utf8");
+          writeLockAtomically(lockFile, payloadFor());
         } catch {
           // best effort; the next beat retries
         }
@@ -124,7 +145,7 @@ export function acquireLock(projectRoot) {
       };
     } catch (error) {
       if (error.code !== "EEXIST") throw error;
-      const existing = readLock(lockFile);
+      const existing = inspectLock(lockFile);
       if (!isStale(existing)) {
         throw new TandemError(
           "locked",

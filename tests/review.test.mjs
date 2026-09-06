@@ -40,6 +40,15 @@ test("review runs a fresh codex exec with the review contract and the verdict sc
   assert.ok(baseCall.stdin.includes("git diff main...HEAD"));
 });
 
+test("combined target options are rejected", () => {
+  const dir = initGitRepo(makeProject("review-target"));
+  startProject(dir);
+  const logFile = path.join(dir, "fake.log");
+  assert.equal(runTandem(["review", "--base", "main", "--uncommitted"], { cwd: dir, env: { FAKE_CODEX_LOG: logFile } }).json.error, "bad_target");
+  assert.equal(runTandem(["review", "--base", "main", "--commit", "HEAD"], { cwd: dir, env: { FAKE_CODEX_LOG: logFile } }).json.error, "bad_target");
+  assert.equal(readLog(logFile).filter((c) => c.argv[0] === "exec").length, 0);
+});
+
 test("an unresolvable ref is rejected before any model call", () => {
   const dir = initGitRepo(makeProject("review-badref"));
   startProject(dir);

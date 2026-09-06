@@ -37,7 +37,18 @@ test("review runs a fresh codex exec with the review contract and the verdict sc
   const base = runTandem(["review", "--base", "main"], { cwd: dir, env: { FAKE_CODEX_LOG: logFile } });
   assert.equal(base.json.target, "--base main");
   const baseCall = readLog(logFile).filter((c) => c.argv[0] === "exec" && c.argv[1] !== "resume").at(-1);
-  assert.ok(baseCall.stdin.includes("git diff main...HEAD"));
+  assert.ok(baseCall.stdin.includes(`git diff ${base.json.resolvedRef}...HEAD`), "prompt must use the resolved hash, not the ref name");
+  assert.ok(!baseCall.stdin.includes("git diff main..."));
+});
+
+test("ref names with shell metacharacters are rejected before git is even asked", () => {
+  const dir = initGitRepo(makeProject("review-refchars"));
+  startProject(dir);
+  const logFile = path.join(dir, "fake.log");
+  for (const bad of ["main; rm -rf x", "main && echo", "ma in", "main`x`"]) {
+    assert.equal(runTandem(["review", "--base", bad], { cwd: dir, env: { FAKE_CODEX_LOG: logFile } }).json.error, "bad_ref", bad);
+  }
+  assert.equal(readLog(logFile).filter((c) => c.argv[0] === "exec").length, 0);
 });
 
 test("combined target options are rejected", () => {

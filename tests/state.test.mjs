@@ -48,6 +48,8 @@ test("lock: live foreign pid blocks, dead or old lock is stale", () => {
   fs.writeFileSync(lockFile, JSON.stringify({ pid: 999999, at: new Date().toISOString() }));
   acquireLock(dir)();
   fs.writeFileSync(lockFile, JSON.stringify({ pid: process.ppid, at: new Date(Date.now() - 60 * 60 * 1000).toISOString() }));
+  const old = new Date(Date.now() - 60 * 60 * 1000);
+  fs.utimesSync(lockFile, old, old); // staleness is judged by the inode's mtime (heartbeat target)
   const release = acquireLock(dir);
   assert.equal(fs.existsSync(lockFile), true);
   release();
@@ -78,13 +80,42 @@ test("a held lock is refreshed by the heartbeat so it never ages into stale whil
   const script = `import { acquireLock } from ${JSON.stringify(stateUrl)}; const release = acquireLock(process.argv[1]); setTimeout(() => { release(); }, 1200);`;
   const child = spawn(process.execPath, ["--input-type=module", "-e", script, dir], { stdio: "ignore", env: { ...process.env, TANDEM_LOCK_HEARTBEAT_MS: "100" } });
   await new Promise((resolve) => setTimeout(resolve, 300));
-  const first = JSON.parse(fs.readFileSync(lockFile, "utf8"));
+  const first = fs.statSync(lockFile).mtimeMs;
+  const content = JSON.parse(fs.readFileSync(lockFile, "utf8"));
   await new Promise((resolve) => setTimeout(resolve, 400));
-  const second = JSON.parse(fs.readFileSync(lockFile, "utf8"));
-  assert.equal(second.token, first.token);
-  assert.ok(Date.parse(second.at) > Date.parse(first.at), "heartbeat must advance the timestamp");
+  const second = fs.statSync(lockFile).mtimeMs;
+  assert.deepEqual(JSON.parse(fs.readFileSync(lockFile, "utf8")), content, "lock content is immutable");
+  assert.ok(second > first, "heartbeat must advance the mtime");
   await new Promise((resolve) => child.on("exit", resolve));
   assert.equal(fs.existsSync(lockFile), false);
+});
+
+test("a holder whose lock was taken over cannot save state (lock_lost) and does not delete the new lock", () => {
+  const dir = project();
+  const { lockFile } = tandemLayout(dir);
+  const release = acquireLock(dir);
+  const mine = JSON.parse(fs.readFileSync(lockFile, "utf8"));
+  // Another process considered us stale, removed our lock and created its own (new inode at the same path).
+  fs.unlinkSync(lockFile);
+  fs.writeFileSync(lockFile, JSON.stringify({ pid: process.ppid, at: new Date().toISOString(), token: "taken-over" }));
+  assert.throws(() => saveState(dir, defaultState(dir)), (e) => e.code === "lock_lost");
+  release();
+  assert.equal(JSON.parse(fs.readFileSync(lockFile, "utf8")).token, "taken-over", "the new owner's lock survives our release");
+  assert.notEqual(mine.token, "taken-over");
+  fs.unlinkSync(lockFile);
+  saveState(dir, defaultState(dir)); // without a held lock, saving works again
+});
+
+test("an old lock whose mtime is stale is taken over even though its pid is alive", () => {
+  const dir = project();
+  const { lockFile, root } = tandemLayout(dir);
+  fs.mkdirSync(root, { recursive: true });
+  fs.writeFileSync(lockFile, JSON.stringify({ pid: process.ppid, at: new Date().toISOString(), token: "old" }));
+  const old = new Date(Date.now() - 2 * 60 * 60 * 1000);
+  fs.utimesSync(lockFile, old, old);
+  const release = acquireLock(dir);
+  assert.notEqual(JSON.parse(fs.readFileSync(lockFile, "utf8")).token, "old");
+  release();
 });
 
 test("the heartbeat never leaves the lock unreadable (atomic rewrite), so a concurrent acquire always sees it held", async () => {

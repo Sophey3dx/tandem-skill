@@ -55,8 +55,16 @@ export function loadState(projectRoot) {
   }
 }
 
+// The lock this process currently holds (one at a time per runner invocation). saveState refuses to write
+// when the lock file no longer carries our token: a holder that lost its lock (e.g. after a long suspend)
+// must not clobber the state of the process that took over.
+let heldLock = null;
+
 export function saveState(projectRoot, state) {
-  const { root, stateFile, backupFile } = tandemLayout(projectRoot);
+  const { root, stateFile, backupFile, lockFile } = tandemLayout(projectRoot);
+  if (heldLock && heldLock.lockFile === lockFile && readLock(lockFile)?.token !== heldLock.token) {
+    throw new TandemError("lock_lost", "This command lost the .tandem/lock to another process; state was not saved.", "Re-run the command. If it happens repeatedly, check for a runaway tandem process.");
+  }
   fs.mkdirSync(root, { recursive: true });
   if (fs.existsSync(stateFile)) fs.copyFileSync(stateFile, backupFile);
   const tmp = `${stateFile}.${process.pid}.tmp`;
@@ -83,14 +91,6 @@ function readLock(lockFile) {
   }
 }
 
-// The lock file is never truncated in place: every write goes to a sibling temp file and is renamed over
-// the lock, so a concurrent reader always sees a complete JSON document.
-function writeLockAtomically(lockFile, payload) {
-  const tmp = `${lockFile}.${process.pid}.${Math.random().toString(16).slice(2, 8)}.tmp`;
-  fs.writeFileSync(tmp, payload, "utf8");
-  fs.renameSync(tmp, lockFile);
-}
-
 function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
@@ -104,38 +104,59 @@ function inspectLock(lockFile) {
   return readLock(lockFile);
 }
 
-function isStale(lock) {
-  if (!lock) return true;
-  const age = lock.at ? Date.now() - Date.parse(lock.at) : Number.POSITIVE_INFINITY;
-  return lock.pid === process.pid || !pidAlive(lock.pid) || age > LOCK_STALE_MS;
+function lockAgeMs(lockFile, lock) {
+  // The heartbeat only touches the inode's mtime; the JSON content is immutable. Fall back to `at` when the
+  // file vanished between read and stat.
+  try {
+    return Date.now() - fs.statSync(lockFile).mtimeMs;
+  } catch {
+    return lock?.at ? Date.now() - Date.parse(lock.at) : Number.POSITIVE_INFINITY;
+  }
 }
 
-// Atomic: the lock file is created with "wx" (fails if it exists). A stale lock is removed only while it
-// still holds exactly the content that was inspected (another process may have replaced it with a live lock
-// in the meantime), then the creation is retried. While held, a heartbeat rewrites the timestamp so the
-// age rule (which exists for recycled pids) never invalidates a live, long-running holder. Release only
-// deletes the file if it still carries our token.
+function isStale(lockFile, lock) {
+  if (!lock) return true;
+  return lock.pid === process.pid || !pidAlive(lock.pid) || lockAgeMs(lockFile, lock) > LOCK_STALE_MS;
+}
+
+// Atomic: the lock file is created with "wx" (fails if it exists) and its content never changes afterwards.
+// The creator keeps the file descriptor open; the heartbeat only touches the mtime of THAT inode
+// (futimes), so a lock that was replaced by another process (new inode at the same path) can never be
+// overwritten by the old holder. Staleness = pid dead, or mtime older than LOCK_STALE_MS (recycled pids,
+// suspended holders). A stale lock is removed only while it still holds exactly the content that was
+// inspected, then the creation is retried. Release only deletes the file if it still carries our token.
 export function acquireLock(projectRoot) {
   const { root, lockFile } = tandemLayout(projectRoot);
   fs.mkdirSync(root, { recursive: true });
   const token = `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
-  const payloadFor = () => JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token });
+  const payload = JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token });
   for (let attempt = 0; attempt < 3; attempt += 1) {
+    let fd = null;
     try {
-      const fd = fs.openSync(lockFile, "wx");
-      fs.writeSync(fd, payloadFor());
-      fs.closeSync(fd);
+      fd = fs.openSync(lockFile, "wx");
+      fs.writeSync(fd, payload);
+      fs.fsyncSync(fd);
       const heartbeat = setInterval(() => {
-        if (readLock(lockFile)?.token !== token) return;
         try {
-          writeLockAtomically(lockFile, payloadFor());
+          const now = new Date();
+          fs.futimesSync(fd, now, now); // our inode only; harmless if the path was taken over
         } catch {
           // best effort; the next beat retries
         }
       }, LOCK_HEARTBEAT_MS);
       heartbeat.unref();
+      heldLock = { lockFile, token };
+      let released = false;
       return () => {
+        if (released) return;
+        released = true;
         clearInterval(heartbeat);
+        if (heldLock?.token === token) heldLock = null;
+        try {
+          fs.closeSync(fd);
+        } catch {
+          // already closed
+        }
         if (readLock(lockFile)?.token !== token) return;
         try {
           fs.unlinkSync(lockFile);
@@ -144,9 +165,16 @@ export function acquireLock(projectRoot) {
         }
       };
     } catch (error) {
+      if (fd !== null) {
+        try {
+          fs.closeSync(fd);
+        } catch {
+          // ignore
+        }
+      }
       if (error.code !== "EEXIST") throw error;
       const existing = inspectLock(lockFile);
-      if (!isStale(existing)) {
+      if (!isStale(lockFile, existing)) {
         throw new TandemError(
           "locked",
           `Another tandem command is running (pid ${existing.pid} since ${existing.at}).`,

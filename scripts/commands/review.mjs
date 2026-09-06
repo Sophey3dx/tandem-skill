@@ -15,25 +15,32 @@ import { extractUsage } from "../lib/usage.mjs";
 // The thread reads the real diff itself (read-only sandbox, git available). A schema-invalid answer gets
 // exactly one retry by resuming that review thread, like contacts and plan rounds.
 
-function describeTarget(options) {
+const REF_PATTERN = /^[A-Za-z0-9._/@^~{}-]+$/;
+
+// Resolve the review target with git BEFORE spending a model call: an unknown ref would otherwise yield a
+// diff-less "OK". Uncommitted reviews need at least one commit (HEAD) to diff against. Only the resolved
+// commit hash is ever placed into the prompt (a ref can move, and ref names may carry shell metacharacters).
+function verifyTarget(project, options) {
+  const ref = options.base ? String(options.base) : options.commit ? String(options.commit) : "HEAD";
+  if (!REF_PATTERN.test(ref)) {
+    throw new TandemError("bad_ref", `Ref "${ref}" contains characters that are not allowed.`, "Use a plain branch, tag or commit name.");
+  }
+  const result = spawnSync("git", ["-C", project, "rev-parse", "--verify", "--quiet", `${ref}^{commit}`], { encoding: "utf8", windowsHide: true });
+  const hash = String(result.stdout ?? "").trim();
+  if (result.status !== 0 || !/^[0-9a-f]{40}$/.test(hash)) {
+    throw new TandemError("bad_ref", `git cannot resolve "${ref}" in ${project}.`, options.base || options.commit ? "Pass an existing branch, tag or commit." : "The repository needs at least one commit before an uncommitted review.");
+  }
+  return hash;
+}
+
+function describeTarget(options, hash) {
   const chosen = ["base", "commit", "uncommitted"].filter((key) => options[key] !== undefined && options[key] !== false);
   if (chosen.length > 1) {
     throw new TandemError("bad_target", `Use exactly one of --uncommitted, --base <ref>, --commit <sha> (got ${chosen.map((k) => `--${k}`).join(", ")}).`);
   }
-  if (options.base) return { flag: ["--base", String(options.base)], label: `Branch gegen ${options.base}`, diffCommand: `git diff ${options.base}...HEAD`, statArgs: ["diff", "--stat", `${options.base}...HEAD`] };
-  if (options.commit) return { flag: ["--commit", String(options.commit)], label: `Commit ${options.commit}`, diffCommand: `git show ${options.commit}`, statArgs: ["show", "--stat", "--format=%h %s", String(options.commit)] };
+  if (options.base) return { flag: ["--base", String(options.base)], label: `Branch gegen ${options.base} (${hash.slice(0, 12)})`, diffCommand: `git diff ${hash}...HEAD`, statArgs: ["diff", "--stat", `${hash}...HEAD`] };
+  if (options.commit) return { flag: ["--commit", String(options.commit)], label: `Commit ${hash.slice(0, 12)}`, diffCommand: `git show ${hash}`, statArgs: ["show", "--stat", "--format=%h %s", hash] };
   return { flag: ["--uncommitted"], label: "uncommittete Änderungen", diffCommand: "git status --short --untracked-files=all && git diff && git diff --cached", statArgs: ["diff", "--stat", "HEAD"] };
-}
-
-// Resolve the review target with git BEFORE spending a model call: an unknown ref would otherwise yield a
-// diff-less "OK". Uncommitted reviews need at least one commit (HEAD) to diff against.
-function verifyTarget(project, options) {
-  const ref = options.base ? String(options.base) : options.commit ? String(options.commit) : "HEAD";
-  const result = spawnSync("git", ["-C", project, "rev-parse", "--verify", "--quiet", `${ref}^{commit}`], { encoding: "utf8", windowsHide: true });
-  if (result.status !== 0 || !String(result.stdout ?? "").trim()) {
-    throw new TandemError("bad_ref", `git cannot resolve "${ref}" in ${project}.`, options.base || options.commit ? "Pass an existing branch, tag or commit." : "The repository needs at least one commit before an uncommitted review.");
-  }
-  return String(result.stdout).trim();
 }
 
 function gitStat(project, statArgs) {
@@ -48,8 +55,12 @@ export async function runReview({ project, options }) {
   if (!fs.existsSync(path.join(project, ".git"))) {
     throw new TandemError("not_git", "review needs a git repository.", "Use `contact --kind final` with a file list and diff excerpt instead.");
   }
-  const target = describeTarget(options);
+  const chosen = ["base", "commit", "uncommitted"].filter((key) => options[key] !== undefined && options[key] !== false);
+  if (chosen.length > 1) {
+    throw new TandemError("bad_target", `Use exactly one of --uncommitted, --base <ref>, --commit <sha> (got ${chosen.map((k) => `--${k}`).join(", ")}).`);
+  }
   const resolvedRef = verifyTarget(project, options);
+  const target = describeTarget(options, resolvedRef);
   const effort = normalizeEffort(options.effort ?? "medium");
   const timeoutMs = minutes(options["deadline-min"] ?? 15);
   return withLock(project, async () => {

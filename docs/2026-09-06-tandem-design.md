@@ -390,6 +390,11 @@ Jeder Prompt enthält einen **Output-Cap** (max. Punkte, max. Zeilen). Die Anzah
 - Design-Galerie in v1: Standalone-Galerie **und** Vite-Route (Idee des Nutzers: „kleiner Vite-Server, um sich verschiedene Designs von euch beiden anzuschauen").
 - Kosten-Zähler und Tandem-Board in v1 (Vorschlag Claude, Nutzer: „passt").
 - Nutzungs-Wächter in v1 (Frage des Nutzers: Restnutzung sehen und bei 0 % nicht mehr auf Codex zugreifen); `account/rateLimits/read` am 2026-09-06 verifiziert.
+
+**Abnahme Plan A (2026-09-06)**
+- 80 Tests grün (Fake-Codex), Smoke gegen echtes Codex 0.153.2 (doctor, start, checkpoint, status) bestanden.
+- Vier Review-Durchgänge mit tandem selbst (zwei frische Diff-Reviews, zwei Final-Kontakte auf dem Dauer-Thread): 18 Code-Befunde, alle behoben. Wichtigste Änderungen gegenüber dem Plan: Abschluss-Review als frischer `codex exec`-Thread (nicht `codex exec review`), unveränderlicher Lock mit offenem fd und mtime-Heartbeat plus `lock_lost`-Schutz beim Speichern, semantische Verdict-Prüfung (Urteil vs. Schwere, Restrisiko, ID-Präfix, newEvidence ab Runde 2), Kontakt-Verbuchung bei Wächter-Ablehnung vor dem Retry, Plan-Archive erst nach gültigem Urteil, Ref-Prüfung vor Reviews, kein Modellaufruf bei unlesbarem Prompt.
+- Schlussurteil des Dauer-Threads: OK („für den Start von Plan B ist keine strukturelle Lücke mehr erkennbar").
 - Spec freigegeben; nächster Schritt writing-plans, danach Duofold-Prüfung des Plans.
 
 **Codex-Review (Duofold, Modus idee, Standard), eingearbeitet**

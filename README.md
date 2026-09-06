@@ -192,7 +192,7 @@ references/
   contracts.md          the contracts in prose (for Claude)
 tests/
   fake-codex.mjs        simulates codex exec / resume / review / app-server / login
-  *.test.mjs            64 tests, `node --test`
+  *.test.mjs            80 tests, `node --test`
   smoke.mjs             opt-in end-to-end run against the real Codex (costs tokens)
 docs/
   2026-09-06-tandem-design.md         design spec (German)
@@ -207,7 +207,7 @@ Inside a project, tandem keeps everything under `.tandem/` (state, lock, ledger,
 ## Development
 
 ```bash
-npm test                                   # 64 tests against the fake codex, no tokens spent
+npm test                                   # 80 tests against the fake codex, no tokens spent
 node tests/smoke.mjs C:\path\outside\TEMP  # real Codex, low effort, a few thousand tokens
 ```
 
@@ -219,7 +219,7 @@ Verified against Codex CLI 0.153.2 on 2026-09-06: cross-process `codex exec resu
 
 ## Credits
 
-Built by [Sophey3dx](https://github.com/Sophey3dx) with Claude (Anthropic). The design and the implementation plan were each reviewed by Codex through the sibling skill *duofold*; ten findings from that review (atomic lock, budget check per attempt, failure accounting, plan-state safety and more) shaped this release.
+Built by [Sophey3dx](https://github.com/Sophey3dx) with Claude (Anthropic). The design and the implementation plan were each reviewed by Codex through the sibling skill *duofold*. The code was then reviewed by tandem itself: four passes (two fresh diff reviews, two verdicts from the persistent thread) surfaced 18 code-level findings, from a lock race and missing failure accounting to shell metacharacters in git refs, all fixed before the first release. The closing verdict of the persistent thread was `OK`.
 
 ## License
 

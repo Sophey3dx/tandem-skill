@@ -70,6 +70,23 @@ test("release only removes the caller's own lock", () => {
   fs.unlinkSync(lockFile);
 });
 
+test("a held lock is refreshed by the heartbeat so it never ages into stale while alive", async () => {
+  const dir = project();
+  const { lockFile } = tandemLayout(dir);
+  const stateUrl = new URL("../scripts/lib/state.mjs", import.meta.url).href;
+  // Child holds the lock for ~1.2 s with a 100 ms heartbeat; we watch the timestamp move.
+  const script = `import { acquireLock } from ${JSON.stringify(stateUrl)}; const release = acquireLock(process.argv[1]); setTimeout(() => { release(); }, 1200);`;
+  const child = spawn(process.execPath, ["--input-type=module", "-e", script, dir], { stdio: "ignore", env: { ...process.env, TANDEM_LOCK_HEARTBEAT_MS: "100" } });
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const first = JSON.parse(fs.readFileSync(lockFile, "utf8"));
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  const second = JSON.parse(fs.readFileSync(lockFile, "utf8"));
+  assert.equal(second.token, first.token);
+  assert.ok(Date.parse(second.at) > Date.parse(first.at), "heartbeat must advance the timestamp");
+  await new Promise((resolve) => child.on("exit", resolve));
+  assert.equal(fs.existsSync(lockFile), false);
+});
+
 test("acquireLock is atomic across processes", async () => {
   const dir = project();
   const stateUrl = new URL("../scripts/lib/state.mjs", import.meta.url).href;

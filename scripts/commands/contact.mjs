@@ -5,7 +5,7 @@ import { guardActive, runWithSchema } from "../lib/exchange.mjs";
 import { TandemError } from "../lib/output.mjs";
 import { ensureLayout, requireAbsolute, stamp } from "../lib/paths.mjs";
 import { renderTemplate } from "../lib/prompts.mjs";
-import { emptyUsage, loadState, saveState, withLock } from "../lib/state.mjs";
+import { loadState, saveState, withLock } from "../lib/state.mjs";
 
 export const KINDS = {
   checkpoint: { schema: "verdict", effort: "low", deadline: 5 },
@@ -38,10 +38,16 @@ export async function runContact({ project, options }) {
     const wrapped = path.join(layout.prompts, `${base}.md`);
     fs.writeFileSync(wrapped, renderTemplate("contact", { CONTACT_ID: contactId, KIND: kind, BODY: body, SCHEMA: spec.schema, CAP: CAPS[spec.schema] }), "utf8");
     const outFile = path.join(layout.replies, `${base}.json`);
-    if (kind === "resume") state.usage.session = emptyUsage(); // new session starts WITH this contact
+    const sessionBefore = structuredClone(state.usage.session);
     const { result, parsed, errors, attempts } = await runWithSchema({
       state, project, layout, base, n, contactId, promptFile: wrapped, schema: spec.schema, effort, deadlineMs, outFile, kind, idPrefix: contactId, options
     });
+    if (kind === "resume") {
+      // A new session starts with this contact: keep only what this contact consumed. Done after the call so a
+      // guard refusal or failure leaves the previous session untouched.
+      const now = state.usage.session;
+      state.usage.session = { input: now.input - sessionBefore.input, output: now.output - sessionBefore.output, total: now.total - sessionBefore.total, runs: now.runs - sessionBefore.runs };
+    }
     state.contacts = n;
     state.lastContact = { id: contactId, kind, at: new Date().toISOString(), status: parsed ? "ok" : "invalid_output", replyPath: outFile, durationMs: result.durationMs, effort };
     saveState(project, state);

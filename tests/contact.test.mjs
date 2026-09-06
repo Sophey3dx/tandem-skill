@@ -70,6 +70,17 @@ test("resume contact starts a new session that includes itself; unknown kind rej
   assert.equal(runTandem(["contact", "--kind", "sparring", "--prompt-file", prompt], { cwd: dir }).json.error, "bad_kind");
 });
 
+test("a resume refused by the budget guard leaves the previous session untouched", () => {
+  const { dir, prompt } = prepared("resume-quota");
+  runTandem(["contact", "--kind", "checkpoint", "--prompt-file", prompt], { cwd: dir });
+  const before = JSON.parse(fs.readFileSync(path.join(dir, ".tandem", "state.json"), "utf8")).usage.session;
+  assert.equal(before.runs, 2, "start + checkpoint");
+  const refused = runTandem(["contact", "--kind", "resume", "--prompt-file", prompt], { cwd: dir, env: { FAKE_USED_PRIMARY: "97" } });
+  assert.equal(refused.json.error, "quota_low");
+  const after = JSON.parse(fs.readFileSync(path.join(dir, ".tandem", "state.json"), "utf8")).usage.session;
+  assert.deepEqual(after, before);
+});
+
 test("a failed contact still consumes its id and records the failure status", () => {
   const { dir, prompt } = prepared("failed");
   const failed = runTandem(["contact", "--kind", "checkpoint", "--prompt-file", prompt], { cwd: dir, env: { FAKE_CODEX_MODE: "fail" } });

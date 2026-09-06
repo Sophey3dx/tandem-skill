@@ -21,6 +21,17 @@ function describeTarget(options) {
   return { flag: ["--uncommitted"], label: "uncommittete Änderungen", diffCommand: "git status --short --untracked-files=all && git diff && git diff --cached", statArgs: ["diff", "--stat", "HEAD"] };
 }
 
+// Resolve the review target with git BEFORE spending a model call: an unknown ref would otherwise yield a
+// diff-less "OK". Uncommitted reviews need at least one commit (HEAD) to diff against.
+function verifyTarget(project, options) {
+  const ref = options.base ? String(options.base) : options.commit ? String(options.commit) : "HEAD";
+  const result = spawnSync("git", ["-C", project, "rev-parse", "--verify", "--quiet", `${ref}^{commit}`], { encoding: "utf8", windowsHide: true });
+  if (result.status !== 0 || !String(result.stdout ?? "").trim()) {
+    throw new TandemError("bad_ref", `git cannot resolve "${ref}" in ${project}.`, options.base || options.commit ? "Pass an existing branch, tag or commit." : "The repository needs at least one commit before an uncommitted review.");
+  }
+  return String(result.stdout).trim();
+}
+
 function gitStat(project, statArgs) {
   const result = spawnSync("git", ["-C", project, ...statArgs], { encoding: "utf8", windowsHide: true });
   const text = String(result.stdout ?? "").trim();
@@ -34,6 +45,7 @@ export async function runReview({ project, options }) {
     throw new TandemError("not_git", "review needs a git repository.", "Use `contact --kind final` with a file list and diff excerpt instead.");
   }
   const target = describeTarget(options);
+  const resolvedRef = verifyTarget(project, options);
   const effort = normalizeEffort(options.effort ?? "medium");
   const timeoutMs = minutes(options["deadline-min"] ?? 15);
   return withLock(project, async () => {
@@ -86,6 +98,6 @@ export async function runReview({ project, options }) {
     if (!parsed) {
       throw new TandemError("invalid_output", `Codex review did not match schema after ${attempts} attempts: ${errors.join("; ")}`, "Read the reply file; rerun review once if it looks like a transient glitch.", { replyPath: outFile, contactId });
     }
-    return { contactId, kind: "review", target: target.flag.join(" "), verdict: parsed, replyPath: outFile, reviewThreadId, durationMs: result.durationMs, attempts, rateLimits: state.rateLimits };
+    return { contactId, kind: "review", target: target.flag.join(" "), resolvedRef, verdict: parsed, replyPath: outFile, reviewThreadId, durationMs: result.durationMs, attempts, rateLimits: state.rateLimits };
   });
 }

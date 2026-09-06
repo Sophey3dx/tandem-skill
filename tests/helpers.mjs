@@ -42,6 +42,20 @@ export function runTandem(args, { cwd, env = {} } = {}) {
   return { status: result.status, json, stdout: result.stdout, stderr: result.stderr };
 }
 
+// A real git repository with one commit on `main` (review needs resolvable refs).
+export function initGitRepo(dir) {
+  const git = (...args) => spawnSync("git", ["-C", dir, ...args], { encoding: "utf8" });
+  git("init", "-q", "-b", "main");
+  git("config", "user.email", "test@example.com");
+  git("config", "user.name", "tandem test");
+  git("config", "commit.gpgsign", "false");
+  writeFile(dir, "README.md", "# fixture\n");
+  git("add", "-A");
+  const commit = git("commit", "-q", "-m", "init");
+  if (commit.status !== 0) throw new Error(`git commit failed: ${commit.stderr}`);
+  return dir;
+}
+
 export function startProject(dir, env = {}) {
   const summary = writeFile(dir, "summary.md", "Testprojekt: kleine Node-Bibliothek, Tests mit node:test.");
   const result = runTandem(["start", "--summary-file", summary], { cwd: dir, env });

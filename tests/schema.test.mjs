@@ -66,6 +66,9 @@ test("semanticErrors catches verdict/severity contradictions, empty risk and for
   assert.ok(semanticErrors("plan-verdict", { ...plan, points: [{ ...major, id: "P1-1", category: "scope", section: null, newEvidence: null }] }).some((e) => e.includes("APPROVE contradicts")));
   assert.ok(semanticErrors("plan-verdict", { ...plan, criteria: { ...plan.criteria, blockersOpen: 2 } }).some((e) => e.includes("APPROVE contradicts")));
   assert.ok(semanticErrors("plan-verdict", { ...plan, verdict: "REVISE" }).some((e) => e.includes("REVISE requires")));
+  const minor = { id: "P1-1", severity: "MINOR", category: "scope", text: "x", section: null, newEvidence: null };
+  assert.ok(semanticErrors("plan-verdict", { ...plan, verdict: "REVISE", points: [minor] }).some((e) => e.includes("MINOR never blocks")));
+  assert.deepEqual(semanticErrors("plan-verdict", { ...plan, verdict: "REVISE", criteria: { ...plan.criteria, blockersOpen: 1 }, points: [minor] }), []);
   assert.ok(semanticErrors("plan-verdict", { ...plan, criteria: { ...plan.criteria, residualRisk: "" } }).some((e) => e.includes("residualRisk")));
 });
 

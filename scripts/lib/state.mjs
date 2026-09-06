@@ -5,6 +5,8 @@ import { tandemLayout } from "./paths.mjs";
 export const STATE_VERSION = 1;
 export const MODES = ["begleiter", "plan", "sparring", "split"];
 export const LOCK_STALE_MS = 30 * 60 * 1000;
+// A held lock is refreshed on this interval so long Codex calls never age into "stale" while alive.
+export const LOCK_HEARTBEAT_MS = Number(process.env.TANDEM_LOCK_HEARTBEAT_MS ?? 60 * 1000);
 export const DEFAULT_MIN_REMAINING = 10;
 
 export function emptyUsage() {
@@ -89,18 +91,30 @@ function isStale(lock) {
 
 // Atomic: the lock file is created with "wx" (fails if it exists). A stale lock is removed only while it
 // still holds exactly the content that was inspected (another process may have replaced it with a live lock
-// in the meantime), then the creation is retried. Release only deletes the file if it still carries our token.
+// in the meantime), then the creation is retried. While held, a heartbeat rewrites the timestamp so the
+// age rule (which exists for recycled pids) never invalidates a live, long-running holder. Release only
+// deletes the file if it still carries our token.
 export function acquireLock(projectRoot) {
   const { root, lockFile } = tandemLayout(projectRoot);
   fs.mkdirSync(root, { recursive: true });
   const token = `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
-  const payload = JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token });
+  const payloadFor = () => JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token });
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
       const fd = fs.openSync(lockFile, "wx");
-      fs.writeSync(fd, payload);
+      fs.writeSync(fd, payloadFor());
       fs.closeSync(fd);
+      const heartbeat = setInterval(() => {
+        if (readLock(lockFile)?.token !== token) return;
+        try {
+          fs.writeFileSync(lockFile, payloadFor(), "utf8");
+        } catch {
+          // best effort; the next beat retries
+        }
+      }, LOCK_HEARTBEAT_MS);
+      heartbeat.unref();
       return () => {
+        clearInterval(heartbeat);
         if (readLock(lockFile)?.token !== token) return;
         try {
           fs.unlinkSync(lockFile);

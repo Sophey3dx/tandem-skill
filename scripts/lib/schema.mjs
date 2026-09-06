@@ -85,7 +85,9 @@ export function semanticErrors(schemaName, value, { idPrefix } = {}) {
     if (value?.verdict === "APPROVE" && (worst || Number(value?.criteria?.blockersOpen) > 0)) {
       errors.push("$.verdict: APPROVE contradicts open BLOCKER/MAJOR points");
     }
-    if (value?.verdict === "REVISE" && points.length === 0) errors.push("$.points: REVISE requires at least one point");
+    if (value?.verdict === "REVISE" && !worst && !(Number(value?.criteria?.blockersOpen) > 0)) {
+      errors.push("$.verdict: REVISE requires a BLOCKER/MAJOR point or blockersOpen > 0 (MINOR never blocks)");
+    }
   }
   return errors;
 }

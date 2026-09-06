@@ -1,6 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { makeProject, runTandem, startProject } from "./helpers.mjs";
+import fs from "node:fs";
+import path from "node:path";
+import { killTree } from "../scripts/lib/codex.mjs";
+import { makeProject, runTandem, startProject, writeFile } from "./helpers.mjs";
+
+const WORKER_BRIEF = ["## Auftragstyp", "Tests", "## Baseline", "x", "## Ziel", "x", "## Nicht-Ziele", "y", "## Erlaubte Dateien", "-", "## Schnittstellen", "-", "## Akzeptanztests", "-", "## Löschrechte", "-", "## Stop-Bedingungen", "-", "## Kontext aus dem Ledger", "-"].join("\n");
 
 test("status summarises state, human flag adds text; mode/config/stop work", () => {
   const dir = makeProject("status");
@@ -18,4 +23,39 @@ test("status summarises state, human flag adds text; mode/config/stop work", () 
   assert.match(json.human, /82 %/);
   runTandem(["stop"], { cwd: dir });
   assert.equal(runTandem(["status"], { cwd: dir }).json.stopped, true);
+});
+
+test("status refreshes workers and stop cancels the active ones", () => {
+  const dir = makeProject("status-workers");
+  startProject(dir);
+  const zone = path.join(dir, "zone");
+  fs.mkdirSync(zone);
+  const brief = writeFile(dir, "brief.md", WORKER_BRIEF);
+  const started = runTandem(["worker", "start", "--zone", zone, "--brief-file", brief, "--deadline-min", "5"], { cwd: dir, env: { FAKE_CODEX_MODE: "hang" } });
+  assert.equal(started.json.ok, true, JSON.stringify(started.json));
+  const status = runTandem(["status", "--human"], { cwd: dir });
+  assert.equal(status.json.workers.length, 1);
+  assert.equal(status.json.workers[0].status, "running");
+  assert.equal(status.json.workers[0].usageBooked, undefined);
+  assert.equal(status.json.activeWorkers, 1);
+  assert.match(status.json.human, /Worker aktiv: 1/);
+  const stopped = runTandem(["stop"], { cwd: dir });
+  assert.equal(stopped.json.cancelledWorkers, 1);
+  assert.equal(stopped.json.unresolvedWorkers, 0);
+  assert.equal(runTandem(["status"], { cwd: dir }).json.workers[0].status, "cancelled");
+});
+
+test("stop reports workers whose kill could not be confirmed", () => {
+  const dir = makeProject("status-killfail");
+  startProject(dir);
+  const zone = path.join(dir, "zone");
+  fs.mkdirSync(zone);
+  const brief = writeFile(dir, "brief.md", WORKER_BRIEF);
+  const started = runTandem(["worker", "start", "--zone", zone, "--brief-file", brief, "--deadline-min", "5"], { cwd: dir, env: { FAKE_CODEX_MODE: "hang" } });
+  const stopped = runTandem(["stop"], { cwd: dir, env: { TANDEM_TEST_NO_KILL: "1" } });
+  assert.equal(stopped.json.unresolvedWorkers, 1);
+  assert.equal(stopped.json.stopped, true);
+  const state = JSON.parse(fs.readFileSync(path.join(dir, ".tandem", "state.json"), "utf8"));
+  assert.equal(state.workers[0].status, "killing");
+  killTree(started.json.worker.pid); // clean up the fake tree ourselves
 });

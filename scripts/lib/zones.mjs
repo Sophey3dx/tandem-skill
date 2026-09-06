@@ -16,7 +16,7 @@ function lower(text) {
 }
 
 // Walks the zone. Fail-closed: anything that cannot be inspected rejects the zone, because the sandbox can
-// only confine what we know about.
+// only confine what we know about. Symlinks/junctions (reparse points) and hard-linked files are rejected.
 function walk(root) {
   const stack = [root];
   let seen = 0;
@@ -33,6 +33,16 @@ function walk(root) {
       if (seen > WALK_LIMIT) throw bad(`Zone has more than ${WALK_LIMIT} entries: ${root}`, "Choose a smaller zone.");
       const full = path.join(dir, entry.name);
       if (entry.isSymbolicLink()) throw bad(`Zone contains a symlink or junction: ${full}`, "Remove it or choose another zone.");
+      if (entry.isFile()) {
+        // A hard link shares its data with a path outside the zone: the sandbox cannot confine that.
+        let links;
+        try {
+          links = fs.lstatSync(full).nlink;
+        } catch (error) {
+          throw bad(`Zone contains an entry that cannot be inspected: ${full} (${error.code ?? error.message})`, "Fix permissions or choose another zone.");
+        }
+        if (links > 1) throw bad(`Zone contains a hard-linked file (${links} links): ${full}`, "Workers could change the shared data outside the zone. Remove the link or choose another zone.");
+      }
       if (entry.isDirectory()) {
         if (FORBIDDEN_DIR_NAMES.has(lower(entry.name))) throw bad(`Zone contains a shared build/cache/VCS folder: ${full}`, "Workers must not touch node_modules, dist, build, .next, target or .git.");
         stack.push(full);

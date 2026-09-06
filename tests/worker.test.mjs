@@ -329,3 +329,87 @@ test("a failing start-time query never declares a live worker gone and never let
   assert.equal(again.json.worker.status, "cancelled");
   assert.equal(runTandem(["worker", "status"], { cwd: dir }).json.active, 0);
 });
+
+test("a record without a persisted pid adopts the launcher's pid (unknown identity) or is given up after the grace", () => {
+  const { dir, zone, brief } = prepared("worker-starting");
+  const a = runTandem(["worker", "start", "--zone", zone, "--brief-file", brief, "--deadline-min", "5"], { cwd: dir, env: { FAKE_CODEX_MODE: "hang" } });
+  assert.equal(a.json.ok, true, JSON.stringify(a.json));
+  const pid = a.json.worker.pid;
+  const marker = JSON.parse(fs.readFileSync(path.join(dir, ".tandem", "workers", "W1", "launched.json"), "utf8"));
+  assert.equal(marker.pid, pid, "the launcher records its own pid before codex starts");
+  assert.ok(Number.isInteger(marker.childPid));
+  // As if the runner had died between reserving the record and saving the pid.
+  let state = stateOf(dir);
+  Object.assign(state.workers[0], { pid: null, procStart: null, identityPending: true, status: "starting" });
+  fs.writeFileSync(path.join(dir, ".tandem", "state.json"), JSON.stringify(state, null, 2));
+  const adopted = runTandem(["worker", "status", "W1"], { cwd: dir });
+  const w = adopted.json.workers[0];
+  assert.equal(w.status, "running", JSON.stringify(w));
+  assert.equal(w.pid, pid);
+  assert.equal(w.pidSource, "launched.json");
+  assert.equal(w.identityUnknown, true, "an adopted pid never gets a verified identity");
+  assert.equal(adopted.json.active, 1, "zone reserved");
+  const cancelled = runTandem(["worker", "cancel", "W1"], { cwd: dir });
+  assert.equal(cancelled.json.worker.status, "killing", "unknown identity is never killed");
+  assert.equal(cancelled.json.worker.killBlockedBy, "identity_unknown");
+  killTree(pid); // clean up ourselves
+  sleepSync(500);
+  assert.equal(runTandem(["worker", "status", "W1"], { cwd: dir }).json.workers[0].status, "cancelled");
+  // A reserved record whose launcher never appeared is given up after the grace period.
+  const zone2 = path.join(dir, "zone2");
+  fs.mkdirSync(zone2);
+  const w2dir = path.join(dir, ".tandem", "workers", "W2");
+  fs.mkdirSync(w2dir, { recursive: true });
+  const record = {
+    id: "W2", zone: fs.realpathSync.native(zone2), pid: null, procStart: null, identityPending: true, effort: "low", model: null, status: "starting",
+    startedAt: new Date(Date.now() - 60 * 1000).toISOString(), deadlineAt: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+    briefPath: path.join(w2dir, "brief.md"), resultPath: path.join(w2dir, "result.json"), logPath: path.join(w2dir, "log.txt"), usageBooked: false
+  };
+  state = stateOf(dir);
+  state.workerSeq = 2;
+  state.workers.push(record);
+  fs.writeFileSync(path.join(dir, ".tandem", "state.json"), JSON.stringify(state, null, 2));
+  const lost = runTandem(["worker", "status", "W2"], { cwd: dir });
+  assert.equal(lost.json.workers[0].status, "failed", JSON.stringify(lost.json));
+  assert.equal(lost.json.workers[0].failure, "spawn_lost");
+  assert.equal(lost.json.active, 0);
+  // Within the grace period the reservation holds and the zone stays reserved.
+  state = stateOf(dir);
+  state.workers[1] = { ...record, startedAt: new Date().toISOString() };
+  fs.writeFileSync(path.join(dir, ".tandem", "state.json"), JSON.stringify(state, null, 2));
+  const pending = runTandem(["worker", "status", "W2"], { cwd: dir });
+  assert.equal(pending.json.workers[0].status, "starting");
+  assert.equal(pending.json.active, 1);
+  assert.equal(runTandem(["worker", "start", "--zone", zone2, "--brief-file", brief], { cwd: dir }).json.error, "bad_zone", "a reserved zone cannot be taken");
+});
+
+test("cancel and stop keep the result of a worker that already finished", () => {
+  const { dir, zone, brief } = prepared("worker-cancel-race");
+  // Result written at once, process lingers: cancel must settle it as done instead of discarding it.
+  const a = runTandem(["worker", "start", "--zone", zone, "--brief-file", brief], { cwd: dir, env: { FAKE_WORKER_LINGER_MS: "4000" } });
+  assert.equal(a.json.ok, true, JSON.stringify(a.json));
+  sleepSync(1200);
+  const cancelled = runTandem(["worker", "cancel", "W1"], { cwd: dir });
+  assert.equal(cancelled.json.gone, true);
+  assert.equal(cancelled.json.worker.status, "done", JSON.stringify(cancelled.json.worker));
+  assert.equal(cancelled.json.worker.result.status, "DONE");
+  assert.equal(stateOf(dir).usage.byKind.worker.runs, 1, "usage booked");
+  // Process already exited between two refreshes: stop must not report it as cancelled.
+  const zone2 = path.join(dir, "zone2");
+  fs.mkdirSync(zone2);
+  const b = runTandem(["worker", "start", "--zone", zone2, "--brief-file", brief], { cwd: dir });
+  assert.equal(b.json.ok, true, JSON.stringify(b.json));
+  sleepSync(1500);
+  const stopped = runTandem(["stop"], { cwd: dir });
+  assert.equal(stopped.json.cancelledWorkers, 0, JSON.stringify(stopped.json));
+  assert.equal(runTandem(["worker", "status", "W2"], { cwd: dir }).json.workers[0].status, "done");
+});
+
+test("wait validates --poll-sec and --timeout-min", () => {
+  const { dir, zone, brief } = prepared("worker-wait-args");
+  assert.equal(runTandem(["worker", "start", "--zone", zone, "--brief-file", brief], { cwd: dir }).json.ok, true);
+  assert.equal(runTandem(["worker", "wait", "W1", "--poll-sec", "abc"], { cwd: dir }).json.error, "bad_args");
+  assert.equal(runTandem(["worker", "wait", "W1", "--poll-sec", "0"], { cwd: dir }).json.error, "bad_args");
+  assert.equal(runTandem(["worker", "wait", "W1", "--timeout-min", "x"], { cwd: dir }).json.error, "bad_deadline");
+  assert.equal(runTandem(["worker", "wait", "W1", "--poll-sec", "1"], { cwd: dir }).json.worker.status, "done");
+});

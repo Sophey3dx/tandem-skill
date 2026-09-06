@@ -20,7 +20,8 @@ export function processStartTime(pid, env = process.env) {
     const ms = Date.parse(iso);
     return Number.isFinite(ms) ? ms : null;
   }
-  const result = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8" });
+  // LC_ALL=C: `lstart` is localized; Date.parse only understands the C-locale form ("Sat Sep  6 18:03:00 2026").
+  const result = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8", env: { ...env, LC_ALL: "C", LANG: "C" } });
   const ms = Date.parse(String(result.stdout ?? "").trim());
   return Number.isFinite(ms) ? Math.floor(ms / 1000) * 1000 : null;
 }

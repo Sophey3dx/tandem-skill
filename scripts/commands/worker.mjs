@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { minutes, normalizeEffort } from "../lib/codex.mjs";
+import { killTree, minutes, normalizeEffort } from "../lib/codex.mjs";
 import { guardActive } from "../lib/exchange.mjs";
 import { TandemError } from "../lib/output.mjs";
 import { ensureLayout, requireAbsolute } from "../lib/paths.mjs";
@@ -25,6 +25,13 @@ function requireId(positionals, verb) {
   const id = positionals[1];
   if (!id) throw new TandemError("bad_args", `worker ${verb} needs a worker id.`, `Example: worker ${verb} W1`);
   return id;
+}
+
+function positiveNumber(value, name, fallback) {
+  if (value === undefined) return fallback;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) throw new TandemError("bad_args", `${name} must be a positive number, got "${value}".`);
+  return n;
 }
 
 async function refreshAndSave(project, state) {
@@ -69,20 +76,37 @@ async function start({ project, options }) {
     const logPath = path.join(dir, "log.txt");
     const realProject = fs.realpathSync.native(project);
     fs.writeFileSync(briefPath, `${brief.trimEnd()}\n\n${renderTemplate("worker-contract", { PROJECT: realProject, ZONE: zone, WORKER_ID: id })}`, "utf8");
-    const { pid } = spawnDetachedCodex({ args: buildWorkerArgs({ zone, effort, outFile: resultPath, model }), stdinFile: briefPath, logFile: logPath, cwd: zone });
     const now = Date.now();
-    // Persist the record FIRST (pid, deadline, zone), so a runner crash never leaves an unregistered
-    // write-capable process; the identity is added right after.
+    // 1. Reserve the record (id, zone, deadline) BEFORE any write-capable process exists. If the runner dies
+    //    from here on, the launcher's launched.json lets the next refresh adopt the pid (unknown identity).
     const worker = {
-      id, zone, pid, procStart: null, identityPending: true, effort, model, status: "running",
+      id, zone, pid: null, procStart: null, identityPending: true, effort, model, status: "starting",
       startedAt: new Date(now).toISOString(), deadlineAt: new Date(now + deadlineMs).toISOString(),
       briefPath, resultPath, logPath, usageBooked: false
     };
     state.workers.push(worker);
     saveState(project, state);
+    // 2. Start the process.
+    let pid;
+    try {
+      ({ pid } = spawnDetachedCodex({ args: buildWorkerArgs({ zone, effort, outFile: resultPath, model }), stdinFile: briefPath, logFile: logPath, cwd: zone }));
+    } catch (error) {
+      Object.assign(worker, { status: "failed", failure: "spawn_failed", errors: [error.message], finishedAt: new Date().toISOString() });
+      saveState(project, state);
+      throw new TandemError("spawn_failed", `Could not start the worker process: ${error.message}`, "Check `doctor` (codex binary) and the worker log.");
+    }
+    // 3. Persist the pid; a process that cannot be registered is killed right away, never left running.
+    Object.assign(worker, { pid, status: "running" });
+    try {
+      saveState(project, state);
+    } catch (error) {
+      killTree(pid);
+      throw error;
+    }
+    // 4. Identity (start time) right after; an unknown identity is never killed and never adopted later.
     worker.procStart = captureStartTime(pid, { attempts: 5, waitMs: 200 });
     worker.identityPending = false;
-    if (worker.procStart === null) worker.identityUnknown = true; // never killed, zone stays reserved until it exits
+    if (worker.procStart === null) worker.identityUnknown = true;
     saveState(project, state);
     return { worker: workerView(worker), activeWorkers: active.length + 1 };
   });
@@ -99,7 +123,7 @@ async function status({ project, positionals }) {
 
 async function wait({ project, positionals, options }) {
   const id = requireId(positionals, "wait");
-  const pollMs = Math.max(500, Number(options["poll-sec"] ?? 5) * 1000);
+  const pollMs = Math.max(500, positiveNumber(options["poll-sec"], "--poll-sec", 5) * 1000);
   const started = Date.now();
   let limit = options["timeout-min"] !== undefined ? started + minutes(options["timeout-min"]) : null;
   for (;;) {
@@ -121,7 +145,9 @@ async function cancel({ project, positionals }) {
   return withLock(project, async () => {
     const state = loadState(project);
     const worker = findWorker(state, id);
-    const { gone } = cancelWorker(state, worker);
+    const layout = ensureLayout(project);
+    await refreshWorkers(state, { project, layout }); // a worker that already finished keeps its result
+    const { gone } = await cancelWorker(state, worker, { project, layout });
     saveState(project, state);
     return { worker: workerView(worker), gone };
   });

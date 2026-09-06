@@ -22,7 +22,7 @@ function launch(logFile, cmd, args, { stdinText = "" } = {}) {
   }
 }
 
-test("the launcher passes stdio through and appends the child's exit code to the log", () => {
+test("the launcher passes stdio through, writes launched.json and appends the child's exit code to the log", () => {
   const dir = makeProject("launch");
   const logFile = path.join(dir, "log.txt");
   const script = "process.stdout.write(require('fs').readFileSync(0,'utf8').toUpperCase() + '\\n'); process.stderr.write('err-line\\n'); process.exit(5)";
@@ -31,9 +31,12 @@ test("the launcher passes stdio through and appends the child's exit code to the
   const text = fs.readFileSync(logFile, "utf8");
   assert.match(text, /^BRIEF TEXT\r?\n/, "stdin reached the child, stdout reached the log");
   assert.match(text, /err-line/, "stderr reached the log");
-  const exit = parseJsonl(fs.readFileSync(logFile, "utf8")).find((e) => e.type === "tandem.exit");
+  const exit = parseJsonl(text).find((e) => e.type === "tandem.exit");
   assert.deepEqual({ code: exit.code, signal: exit.signal }, { code: 5, signal: null });
   assert.ok(Date.parse(exit.at) > 0);
+  const marker = JSON.parse(fs.readFileSync(path.join(dir, "launched.json"), "utf8"));
+  assert.equal(marker.pid, result.pid, "launched.json names the launcher itself");
+  assert.ok(Number.isInteger(marker.childPid), "and the child it started");
 });
 
 test("the launcher reports a command that cannot be started (no shell, no throw) as exit 127", () => {
@@ -44,6 +47,7 @@ test("the launcher reports a command that cannot be started (no shell, no throw)
   const exit = parseJsonl(fs.readFileSync(logFile, "utf8")).find((e) => e.type === "tandem.exit");
   assert.equal(exit.code, 127);
   assert.match(exit.error, /ENOENT/);
+  assert.ok(fs.existsSync(path.join(dir, "launched.json")), "the marker is written before the spawn attempt");
 });
 
 test("the launcher refuses to run without a log file and a command", () => {

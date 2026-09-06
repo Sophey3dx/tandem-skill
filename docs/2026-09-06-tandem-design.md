@@ -366,7 +366,7 @@ Jeder Prompt enthält einen **Output-Cap** (max. Punkte, max. Zeilen). Die Anzah
 3. Exakter Fehlertext bei Limit/Quota und bei nicht auffindbarem Thread (für die Klassifikation).
 4. Detached Worker unter Windows: Start via `cmd /c` mit stdin-Redirect aus der Brief-Datei, `detached: true`, `unref()`; Prozessbaum-Kill per `taskkill /T /F`.
 5. Verhalten von `-C` in Kombination mit relativem `-o` (wir nutzen ohnehin nur absolute Pfade).
-6. Reparse-Point-Erkennung per `fs.lstat` (Symlink/Junction); Hardlinks sind unter Windows nicht sicher erkennbar → als bekanntes Restrisiko dokumentieren.
+6. Reparse-Point-Erkennung per `fs.lstat` (Symlink/Junction); hart verlinkte Dateien über den Linkzähler (`lstat().nlink > 1`, unter Windows aus `nNumberOfLinks`) — verifiziert, die Zone wird dann abgelehnt.
 7. Vite: zusätzliche Root-HTML-Datei wird im Dev-Server ohne Config-Änderung serviert; `import.meta.glob` mit Klammer-Muster für die Varianten; `?raw`-Import der Notizen. Bei Projekten mit `appType: 'spa'`-Fallback oder eigenem `root` ggf. Pfad anpassen.
 8. Codex-Worker in der Vite-Zone kann `node_modules` des Projekts lesen (Typen, Komponenten), aber nicht schreiben; prüfen, dass Type-Checks/Imports aus der Zone heraus funktionieren.
 9. Exaktes Format der Usage-Angaben: Felder im JSONL-Event `turn.completed` (`usage.input_tokens`, `usage.output_tokens`, ggf. cached) und die `tokens used`-Zeile auf stderr (beobachtet: `tokens used` gefolgt von `57.717` unter de-DE).
@@ -410,6 +410,7 @@ Jeder Prompt enthält einen **Output-Cap** (max. Punkte, max. Zeilen). Die Anzah
 - Plan B wurde als erster echter Plan-Konsens über den Dauer-Thread des Skill-Repos verhandelt: drei Runden, 16 Einwände, alle übernommen; nach Runde 3 ohne Konsens Entscheidung des Nutzers, P3-1 bis P3-4 einzuarbeiten und zu bauen.
 - Verifiziert gegen echtes Codex: `codex exec fork --ephemeral` mit Schema (Lane) und ein Worker in einer Zone inklusive sicherem Isolations-Negativtest (Smoke `tests/smoke-workers.mjs`).
 - Härtung nach dem ersten Smoke: Codex 0.153.2 beendete sich nach regulärem `task_complete` während des internen Shutdowns, ohne die `-o`-Datei zu schreiben (Windows, nach Sandbox-Kommandos; in `codex exec` läuft `print_final_output` erst nach `client.shutdown()`). Seitdem startet der Runner Worker über `lib/worker-launch.mjs` (Exitcode landet als `tandem.exit` im Log), übernimmt ein fehlendes Ergebnis aus der letzten Agent-Nachricht des Logs (`resultSource: log`) und behandelt eine fehlgeschlagene Startzeit-Abfrage als „unverified" statt „gone".
+- Frischer Diff-Review C10 (BLOCK, fünf Punkte), alle umgesetzt: Worker-Eintrag wird vor dem Spawn reserviert (`starting`), der Launcher schreibt `launched.json` vor dem Codex-Start, ein nicht speicherbarer Prozess wird sofort beendet, ein verwaister Eintrag ohne Launcher endet nach zehn Sekunden als `spawn_lost`; hart verlinkte Dateien in Zonen werden per Linkzähler abgelehnt; `cancel`/`stop` frischen zuerst auf und behalten fertige Ergebnisse (auch ein `killing`-Worker, der mit Bericht endet); `ps` läuft mit `LC_ALL=C`; `--poll-sec`/`--timeout-min` werden validiert.
 
 **Codex-Review (Duofold, Modus idee, Standard), eingearbeitet**
 - Kanal A bestätigt; B und C verworfen bzw. auf v2 verschoben.

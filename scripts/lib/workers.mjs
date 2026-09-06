@@ -11,10 +11,13 @@ import { addUsage } from "./state.mjs";
 import { extractUsage } from "./usage.mjs";
 
 export const TERMINAL_STATUSES = new Set(["done", "partial", "blocked", "timeout", "orphaned", "cancelled", "invalid_output", "failed"]);
-export const ACTIVE_STATUSES = new Set(["running", "finishing", "killing"]);
+// `starting`: the record (id, zone, deadline) is persisted, the pid is not yet. The zone is reserved already.
+export const ACTIVE_STATUSES = new Set(["starting", "running", "finishing", "killing"]);
 export const REQUIRED_BRIEF_SECTIONS = ["Auftragstyp", "Baseline", "Ziel", "Nicht-Ziele", "Erlaubte Dateien", "Schnittstellen", "Akzeptanztests", "Löschrechte", "Stop-Bedingungen", "Kontext aus dem Ledger"];
+export const LAUNCH_MARKER = "launched.json";
 const LAUNCHER = fileURLToPath(new URL("./worker-launch.mjs", import.meta.url));
 const KILL_CONFIRM_MS = 5000;
+const STARTING_GRACE_MS = 10 * 1000;
 const RETRY_EFFORT = "low";
 const RETRY_DEADLINE_MS = 5 * 60 * 1000;
 // Failure classes that mean "codex refused or lost the session" rather than "the process vanished".
@@ -38,10 +41,10 @@ export function buildWorkerArgs({ zone, effort, outFile, model = null }) {
 
 // Starts codex detached WITHOUT any shell, through the tiny launcher in worker-launch.mjs: stdin is the
 // opened brief file, stdout and stderr are the opened log file (inherited descriptors), so no cmd.exe/sh
-// quoting or %VAR% expansion can ever rewrite a validated path. The launcher appends a final
-// {"type":"tandem.exit"} line to the log when codex exits, so the exit code survives although nobody waits.
-// The pid is the launcher (`taskkill /T` kills its tree; on POSIX the detached process leads its own group).
-// Identity (start time) is captured by the caller AFTER the record is persisted.
+// quoting or %VAR% expansion can ever rewrite a validated path. The launcher writes launched.json (its pid)
+// before codex starts and appends a final {"type":"tandem.exit"} line to the log when codex exits, so the
+// exit code of a process nobody waits for is known. The pid is the launcher (`taskkill /T` kills its tree;
+// on POSIX the detached process leads its own group). Identity (start time) is captured by the caller.
 export function spawnDetachedCodex({ args, stdinFile, logFile, cwd, env = process.env }) {
   const { cmd, prefix } = resolveCodex(env);
   const inFd = fs.openSync(stdinFile, "r");
@@ -87,6 +90,16 @@ export function readWorkerResult(worker, events = workerEvents(worker)) {
   return message ? { raw: message.item.text, source: "log" } : null;
 }
 
+// launched.json next to the log: written by the launcher before codex starts.
+export function launchMarker(worker) {
+  try {
+    const marker = JSON.parse(fs.readFileSync(path.join(path.dirname(worker.logPath), LAUNCH_MARKER), "utf8"));
+    return Number.isInteger(marker.pid) && marker.pid > 0 ? marker : null;
+  } catch {
+    return null;
+  }
+}
+
 // Usage from the log: JSONL events first, `tokens used` stderr line as fallback. Booked once, after exit.
 export function bookWorkerUsage(state, worker) {
   if (worker.usageBooked) return;
@@ -102,9 +115,11 @@ function finish(state, worker, status, now, extra = {}) {
 }
 
 // Kills only a process that is verifiably ours (pid AND start time), then waits up to KILL_CONFIRM_MS for it
-// to disappear. Without a verified identity nothing is ever killed: an unknown identity (never captured) and
-// an unverifiable one (the start-time query fails right now) both leave the worker active as `killing`.
+// to disappear. Without a verified identity nothing is ever killed: an unknown identity (never captured), an
+// unverifiable one (the start-time query fails right now) and a record without a pid all leave the worker
+// active as `killing`.
 export function killWorker(worker, env = process.env) {
+  if (worker.pid === null || worker.pid === undefined) return { gone: false, killed: false, reason: "starting" };
   const state = processState(worker);
   if (state === "gone" || state === "foreign") return { gone: true, killed: false };
   if (state === "unverified") {
@@ -175,26 +190,72 @@ function recordExit(worker, events) {
   return exit;
 }
 
+// The process is gone: a complete report (file or log) is the result, whatever the caller intended;
+// otherwise the worker ends with `fallback` (orphaned/failed classification, a kill reason, …).
+async function settleGone(state, worker, ctx, fallback) {
+  const events = workerEvents(worker);
+  const exit = recordExit(worker, events);
+  if (readWorkerResult(worker, events)) {
+    await settleResult(state, worker, ctx);
+    return;
+  }
+  fallback(exit);
+}
+
+function orphanOrFail(state, worker, now, exit) {
+  // Exit code 0 without any report is "no_result"; a missing exit record (launcher killed) counts as 1.
+  const failure = classifyFailure({ status: exit?.code ?? 1, timedOut: false, stderr: readLogText(worker.logPath) }) ?? "no_result";
+  if (failure === "quota") state.paused = true;
+  finish(state, worker, FAILED_CLASSES.has(failure) ? "failed" : "orphaned", now, { failure });
+}
+
+// A record without a persisted pid (the runner died between reserving the record and saving the pid):
+// adopt the pid from the launcher's marker with an unknown identity (never killed, zone reserved until the
+// process exits by itself), or give the record up once the grace period has passed without a launcher.
+// Returns "resolved" | "pending" | "lost".
+function resolvePid(worker, now) {
+  if (worker.pid !== null && worker.pid !== undefined) return "resolved";
+  const marker = launchMarker(worker);
+  if (marker) {
+    Object.assign(worker, { pid: marker.pid, identityPending: false, identityUnknown: true, pidSource: LAUNCH_MARKER });
+    if (worker.status === "starting") worker.status = "running";
+    return "resolved";
+  }
+  return now - Date.parse(worker.startedAt) > STARTING_GRACE_MS ? "lost" : "pending";
+}
+
 // Brings every non-terminal worker up to date. Terminal only after the process is verifiably gone.
 // Pending schema retries are model calls: they rest while tandem is paused or stopped.
 export async function refreshWorkers(state, { project, layout, now = Date.now(), env = process.env } = {}) {
+  const ctx = { project, layout, env, now };
   let changed = false;
   for (const worker of state.workers ?? []) {
     if (worker.status === "retry_pending") {
       if (state.paused || state.stopped) continue;
-      await settleResult(state, worker, { project, layout, env, now });
+      await settleResult(state, worker, ctx);
       changed = worker.status !== "retry_pending" || changed;
       continue;
     }
     if (!ACTIVE_STATUSES.has(worker.status)) continue;
+    const resolution = resolvePid(worker, now);
+    if (resolution === "pending") continue;
+    if (resolution === "lost") {
+      if (worker.status === "killing") finish(state, worker, worker.killReason, now, { killFailed: false });
+      else finish(state, worker, "failed", now, { failure: "spawn_lost" });
+      changed = true;
+      continue;
+    }
+    if (worker.pidSource === LAUNCH_MARKER && worker.status === "running" && !worker.adoptedAt) {
+      worker.adoptedAt = new Date(now).toISOString();
+      changed = true;
+    }
     // procStart is never taken over from the current pid owner later; an unknown identity stays unknown.
     if (worker.procStart === null || worker.procStart === undefined) worker.identityUnknown = true;
     const alive = sameProcess(worker);
     const hasResult = fs.existsSync(worker.resultPath);
     if (worker.status === "killing") {
       if (alive) continue;
-      recordExit(worker, workerEvents(worker));
-      finish(state, worker, worker.killReason, now, { killFailed: false });
+      await settleGone(state, worker, ctx, () => finish(state, worker, worker.killReason, now, { killFailed: false }));
       changed = true;
       continue;
     }
@@ -204,38 +265,35 @@ export async function refreshWorkers(state, { project, layout, now = Date.now(),
         changed = true;
       } else if (now > Date.parse(worker.deadlineAt)) {
         const kill = killWorker(worker, env);
-        if (kill.gone) finish(state, worker, "timeout", now, { killReason: "timeout" });
+        if (kill.gone) await settleGone(state, worker, ctx, () => finish(state, worker, "timeout", now, { killReason: "timeout" }));
         else Object.assign(worker, { status: "killing", killReason: "timeout", killFailed: true, killBlockedBy: kill.reason ?? "kill_failed" });
         changed = true;
       }
       continue;
     }
     // Process gone: the -o file or, failing that, the final message in the log is the report.
-    const events = workerEvents(worker);
-    const exit = recordExit(worker, events);
-    if (readWorkerResult(worker, events)) {
-      await settleResult(state, worker, { project, layout, env, now });
-    } else {
-      // Exit code 0 without any report is "no_result"; a missing exit record (launcher killed) counts as 1.
-      const failure = classifyFailure({ status: exit?.code ?? 1, timedOut: false, stderr: readLogText(worker.logPath) }) ?? "no_result";
-      if (failure === "quota") state.paused = true;
-      finish(state, worker, FAILED_CLASSES.has(failure) ? "failed" : "orphaned", now, { failure });
-    }
+    await settleGone(state, worker, ctx, (exit) => orphanOrFail(state, worker, now, exit));
     changed = true;
   }
   return changed;
 }
 
-export function cancelWorker(state, worker, env = process.env) {
+// Cancels one worker. Callers refresh first, so a process that already finished is settled as its result,
+// not discarded. Even a kill that finds the process gone keeps a complete report.
+export async function cancelWorker(state, worker, { project, layout, env = process.env, now = Date.now() } = {}) {
+  const ctx = { project, layout, env, now };
   if (worker.status === "retry_pending") {
-    finish(state, worker, "cancelled", Date.now(), { killReason: "cancelled", killFailed: false });
+    finish(state, worker, "cancelled", now, { killReason: "cancelled", killFailed: false });
     return { gone: true, changed: true };
   }
   if (!ACTIVE_STATUSES.has(worker.status)) return { gone: true, changed: false };
   const kill = killWorker(worker, env);
-  if (kill.gone) finish(state, worker, "cancelled", Date.now(), { killReason: "cancelled", killFailed: false });
-  else Object.assign(worker, { status: "killing", killReason: "cancelled", killFailed: true, killBlockedBy: kill.reason ?? "kill_failed" });
-  return { gone: kill.gone, changed: true };
+  if (!kill.gone) {
+    Object.assign(worker, { status: "killing", killReason: "cancelled", killFailed: true, killBlockedBy: kill.reason ?? "kill_failed" });
+    return { gone: false, changed: true };
+  }
+  await settleGone(state, worker, ctx, () => finish(state, worker, "cancelled", now, { killReason: "cancelled", killFailed: false }));
+  return { gone: true, changed: true };
 }
 
 export function activeZones(state) {

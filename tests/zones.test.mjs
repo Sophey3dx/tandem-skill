@@ -93,3 +93,21 @@ test("zones must not overlap active zones", () => {
   assert.equal(code(() => checkZone({ project, zone: active, activeZones: [active] })), "bad_zone");
   same(checkZone({ project, zone: zoneIn(project, "b"), activeZones: [active] }), path.join(project, "b"));
 });
+
+test("hard-linked files inside the zone are rejected (their data also lives outside the zone)", () => {
+  const project = makeProject("zone-hardlink");
+  const zone = zoneIn(project, "src/linked");
+  const outside = path.join(project, "shared.txt");
+  fs.writeFileSync(outside, "shared");
+  fs.linkSync(outside, path.join(zone, "alias.txt"));
+  let error = null;
+  try {
+    checkZone({ project, zone });
+  } catch (caught) {
+    error = caught;
+  }
+  assert.equal(error?.code, "bad_zone");
+  assert.match(error.message, /hard-linked/);
+  fs.unlinkSync(path.join(zone, "alias.txt"));
+  same(checkZone({ project, zone }), zone); // a single link is an ordinary file again
+});

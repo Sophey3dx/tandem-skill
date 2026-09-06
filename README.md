@@ -28,7 +28,7 @@ Tandem fixes all three: a persistent thread, a contact protocol with schema-vali
 | **Plan consensus with automode** | A plan travels between Claude and Codex for at most three rounds. Codex answers `APPROVE / REVISE`; the runner computes a hard `consensus` flag (no open BLOCKER/MAJOR, sources read, test strategy feasible, residual risk named). On consensus the plan is executed without a human stop. No consensus after round three: both positions go to the user. |
 | **Two final verdicts** | The persistent thread checks goal fidelity and earlier objections; a fresh Codex thread with an explicit review contract reads the real diff and looks for bugs without conversation bias. |
 | **Sparring and lanes** | Free-form questions on the persistent thread, plus ephemeral forks of it (counter-position, premortem, alternative) whose answers never pollute the main thread. |
-| **Work split** | Codex workers implement bounded tasks with write access, detached and in parallel (max. two), confined by the OS sandbox to a zone folder the runner validates (real paths, no shared caches, no reparse points, never under TEMP). No shell in the spawn path. Process identity is verified (pid + exact start time) before anything is killed; a zone stays reserved until the process is provably gone. Structured `DONE / PARTIAL / BLOCKED` results with tests and touched files; one budget-checked schema retry. Tasks are allocated by strength: Codex gets test-writing, parsers and converters against a spec, ports, migrations, repo research and audits; Claude keeps UI, cross-cutting changes, architecture, integration and everything that needs the user. Optional `--model` per worker. |
+| **Work split** | Codex workers implement bounded tasks with write access, detached and in parallel (max. two), confined by the OS sandbox to a zone folder the runner validates (real paths, no shared caches, no reparse points, no hard-linked files, never under TEMP). No shell in the spawn path. The record is reserved in the state before the process exists, and the launcher writes `launched.json` before Codex starts, so a runner that dies mid-start never leaves an unregistered write-capable process. Process identity is verified (pid + exact start time) before anything is killed; a zone stays reserved until the process is provably gone. Structured `DONE / PARTIAL / BLOCKED` results with tests and touched files; one budget-checked schema retry. Tasks are allocated by strength: Codex gets test-writing, parsers and converters against a spec, ports, migrations, repo research and audits; Claude keeps UI, cross-cutting changes, architecture, integration and everything that needs the user. Optional `--model` per worker. |
 | **Cost counter** | Token usage per Codex run, summed in total, per contact kind and per session. |
 | **Usage guard** | Before every model call the runner asks the Codex app-server for the remaining quota (5-hour and weekly windows). Below the threshold (default 10 %) it refuses with `quota_low` and the reset time. |
 | **State, lock, rotation** | Atomic state file with backup, cross-process lock, thread history, rotation to a fresh thread seeded from the ledger. |
@@ -108,7 +108,7 @@ All Codex calls go through `scripts/tandem.mjs`. It prints exactly one JSON line
 | `contact --kind sparring --prompt-file <abs>` | Free-form question with the sparring schema (position, reasons, risks, recommendation). |
 | `lane --kind gegenposition\|premortem\|alternative --prompt-file <abs>` | Ephemeral fork of the thread; one schema retry by forking again. |
 | `worker start --zone <abs> --brief-file <abs> [--effort] [--deadline-min 20] [--model <name>]` | Validates the zone and the brief (ten mandatory headings), appends the worker contract, starts Codex detached with `workspace-write` confined to the zone. |
-| `worker status [id]`, `worker wait <id> [--poll-sec 5]`, `worker cancel <id>` | Lifecycle: results are validated after the process exits, deadlines and cancels kill the verified process tree and wait for it to disappear, usage is booked from the log. The exit code of the detached process is recorded (`exitCode`, appended to the log by a tiny launcher), and a report that Codex left only in its log is accepted as `resultSource: "log"`. |
+| `worker status [id]`, `worker wait <id> [--poll-sec 5]`, `worker cancel <id>` | Lifecycle: results are validated after the process exits, deadlines and cancels kill the verified process tree and wait for it to disappear, usage is booked from the log. `cancel` and `stop` refresh first and keep the report of a worker that already finished (it ends as `done`, not `cancelled`). The exit code of the detached process is recorded (`exitCode`, appended to the log by a tiny launcher), and a report that Codex left only in its log is accepted as `resultSource: "log"`. |
 
 ### Contact envelope
 
@@ -179,6 +179,7 @@ If the query itself fails, the guard fails open and `status` shows the quota as 
 | `paused` / `stopped` | tandem is paused or stopped | `unpause`, or `--force` for a single contact |
 | `not_git` | `review` needs a git repository | Uses a second `final` contact with a diff excerpt |
 | `bad_zone` / `too_many_workers` / `brief_incomplete` | Zone rejected, two workers already active, or the brief lacks mandatory headings | Fixes the zone or brief, or waits for a worker |
+| `spawn_failed` / `spawn_lost` | The worker process could not be started, or a reserved record never saw its launcher (runner died mid-start) | Reads the worker log, checks `doctor`, starts again |
 | `codex_not_found` / `auth` | Codex missing or not logged in | `npm install -g @openai/codex`, `codex login` |
 
 Failed contacts still consume their contact number and are recorded with their status, so the next attempt gets fresh files.
@@ -201,7 +202,7 @@ references/
   contracts.md          the contracts in prose (for Claude)
 tests/
   fake-codex.mjs        simulates codex exec / resume / review / app-server / login
-  *.test.mjs            112 tests, `node --test`
+  *.test.mjs            116 tests, `node --test`
   smoke.mjs             opt-in end-to-end run against the real Codex (costs tokens)
   smoke-workers.mjs     opt-in: lane + sandboxed worker with a safe isolation probe (costs tokens)
 docs/
@@ -218,7 +219,7 @@ Inside a project, tandem keeps everything under `.tandem/` (state, lock, ledger,
 ## Development
 
 ```bash
-npm test                                          # 112 tests against the fake codex, no tokens spent
+npm test                                          # 116 tests against the fake codex, no tokens spent
 node tests/smoke.mjs C:\path\outside\TEMP         # real Codex, low effort, a few thousand tokens
 node tests/smoke-workers.mjs C:\path\outside\TEMP # real Codex: lane + sandboxed worker with isolation probe
 ```

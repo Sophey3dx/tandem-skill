@@ -67,7 +67,19 @@ test("resume contact starts a new session that includes itself; unknown kind rej
   const resumed = runTandem(["contact", "--kind", "resume", "--prompt-file", prompt], { cwd: dir });
   assert.equal(resumed.json.usage.runs, 1);
   assert.equal(resumed.json.usage.total, 120);
-  assert.equal(runTandem(["contact", "--kind", "sparring", "--prompt-file", prompt], { cwd: dir }).json.error, "bad_kind");
+  assert.equal(runTandem(["contact", "--kind", "gossip", "--prompt-file", prompt], { cwd: dir }).json.error, "bad_kind");
+});
+
+test("sparring contact uses the sparring schema with medium effort", () => {
+  const { dir, prompt, logFile } = prepared("sparring");
+  const { json } = runTandem(["contact", "--kind", "sparring", "--prompt-file", prompt], { cwd: dir, env: { FAKE_CODEX_LOG: logFile } });
+  assert.equal(json.ok, true, JSON.stringify(json));
+  assert.equal(json.verdict.position, "fake position");
+  assert.equal(json.verdict.recommendation, "do it");
+  const call = readLog(logFile).find((c) => c.argv[1] === "resume");
+  assert.ok(call.argv.includes("model_reasoning_effort=medium"));
+  assert.ok(call.argv.some((a) => a.endsWith("sparring.schema.json")));
+  assert.ok(call.stdin.includes("Tandem-Kontakt C1 (sparring)"));
 });
 
 test("a resume refused by the budget guard leaves the previous session untouched", () => {

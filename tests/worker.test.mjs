@@ -4,7 +4,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { killTree, parseJsonl } from "../scripts/lib/codex.mjs";
 import { sleepSync } from "../scripts/lib/procs.mjs";
-import { makeProject, readLog, runTandem, startProject, writeFile } from "./helpers.mjs";
+import { spawnSync } from "node:child_process";
+import { SKILL_ROOT, makeProject, readLog, runTandem, startProject, writeFile } from "./helpers.mjs";
 
 const BRIEF = [
   "# Auftrag W",
@@ -489,4 +490,43 @@ test("a worker whose launch marker cannot be written ends as failed/spawn_failed
   assert.equal(waited.json.worker.exitCode, 65);
   assert.equal(readLog(logFile).filter((c) => c.argv[0] === "exec").length, 0, "codex never started");
   assert.equal(runTandem(["worker", "status"], { cwd: dir }).json.active, 0, "zone released only after the verdict");
+});
+
+test("giving a reserved record up claims the marker, so a late launcher can never start into the freed zone", () => {
+  const { dir, zone, brief } = prepared("worker-abandon");
+  const w1dir = path.join(dir, ".tandem", "workers", "W1");
+  fs.mkdirSync(w1dir, { recursive: true });
+  const record = {
+    id: "W1", zone: fs.realpathSync.native(zone), pid: null, procStart: null, identityPending: true, effort: "low", model: null, status: "starting",
+    startedAt: new Date(Date.now() - 60 * 1000).toISOString(), deadlineAt: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+    briefPath: path.join(w1dir, "brief.md"), resultPath: path.join(w1dir, "result.json"), logPath: path.join(w1dir, "log.txt"), usageBooked: false
+  };
+  const state = stateOf(dir);
+  state.workerSeq = 1;
+  state.workers.push(record);
+  fs.writeFileSync(path.join(dir, ".tandem", "state.json"), JSON.stringify(state, null, 2));
+  const lost = runTandem(["worker", "status", "W1"], { cwd: dir });
+  assert.equal(lost.json.workers[0].failure, "spawn_lost", JSON.stringify(lost.json));
+  const marker = JSON.parse(fs.readFileSync(path.join(w1dir, "launched.json"), "utf8"));
+  assert.equal(marker.abandoned, true, "the runner claimed the marker exclusively");
+  // A launcher that only now gets scheduled must refuse to start: its exclusive create fails.
+  const launcher = path.join(SKILL_ROOT, "scripts", "lib", "worker-launch.mjs");
+  const witness = path.join(zone, "started.txt");
+  const late = spawnSync(process.execPath, [launcher, record.logPath, process.execPath, "-e", `require('fs').writeFileSync(${JSON.stringify(witness)}, 'started')`], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  assert.equal(late.status, 65);
+  assert.equal(fs.existsSync(witness), false, "nothing was written into the freed zone");
+  // Same grace expiry, but the launcher wrote its marker first: the pid is adopted instead of abandoned.
+  const zone2 = path.join(dir, "zone2");
+  fs.mkdirSync(zone2);
+  const w2dir = path.join(dir, ".tandem", "workers", "W2");
+  fs.mkdirSync(w2dir, { recursive: true });
+  fs.writeFileSync(path.join(w2dir, "launched.json"), JSON.stringify({ pid: process.pid, at: new Date().toISOString() }), "utf8");
+  const state2 = stateOf(dir);
+  state2.workerSeq = 2;
+  state2.workers.push({ ...record, id: "W2", zone: fs.realpathSync.native(zone2), briefPath: path.join(w2dir, "brief.md"), resultPath: path.join(w2dir, "result.json"), logPath: path.join(w2dir, "log.txt") });
+  fs.writeFileSync(path.join(dir, ".tandem", "state.json"), JSON.stringify(state2, null, 2));
+  const adopted = runTandem(["worker", "status", "W2"], { cwd: dir });
+  assert.equal(adopted.json.workers[0].status, "running", JSON.stringify(adopted.json));
+  assert.equal(adopted.json.workers[0].pid, process.pid);
+  assert.equal(adopted.json.workers[0].identityUnknown, true);
 });

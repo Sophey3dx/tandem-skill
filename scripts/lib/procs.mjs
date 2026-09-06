@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import fs from "node:fs";
 import { pidAlive } from "./state.mjs";
 
 export function sleepSync(ms) {
@@ -20,10 +21,25 @@ export function processStartTime(pid, env = process.env) {
     const ms = Date.parse(iso);
     return Number.isFinite(ms) ? ms : null;
   }
-  // LC_ALL=C: `lstart` is localized; Date.parse only understands the C-locale form ("Sat Sep  6 18:03:00 2026").
+  // Linux: /proc/<pid>/stat field 22 (start time in clock ticks since boot, typically 10 ms resolution) — only
+  // this source on Linux, never mixed with ps, so identities stay comparable across checks.
+  if (process.platform === "linux") return linuxStartTicks(pid);
+  // Other POSIX: `ps -o lstart` (whole seconds; a pid reused within the same second is not distinguishable,
+  // see the documentation). LC_ALL=C: `lstart` is localized; Date.parse only understands the C-locale form.
   const result = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8", env: { ...env, LC_ALL: "C", LANG: "C" } });
   const ms = Date.parse(String(result.stdout ?? "").trim());
   return Number.isFinite(ms) ? Math.floor(ms / 1000) * 1000 : null;
+}
+
+function linuxStartTicks(pid) {
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    const rest = stat.slice(stat.lastIndexOf(")") + 2).split(" "); // fields from 3 (state) on; comm may hold spaces
+    const ticks = Number(rest[19]); // field 22
+    return Number.isInteger(ticks) ? ticks : null;
+  } catch {
+    return null;
+  }
 }
 
 // Right after a spawn the process may not be visible yet; retry briefly. Returns null when it never was.

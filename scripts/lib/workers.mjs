@@ -99,13 +99,30 @@ export function readWorkerResult(worker, events = workerEvents(worker)) {
   return message ? { raw: message.item.text, source: "log" } : null;
 }
 
-// launched.json next to the log: written by the launcher before codex starts.
+function markerPath(worker) {
+  return path.join(path.dirname(worker.logPath), LAUNCH_MARKER);
+}
+
+// launched.json next to the log: created exclusively by the launcher before codex starts. An "abandoned"
+// marker (written by the runner when it gave the record up) carries no pid and counts as absent.
 export function launchMarker(worker) {
   try {
-    const marker = JSON.parse(fs.readFileSync(path.join(path.dirname(worker.logPath), LAUNCH_MARKER), "utf8"));
+    const marker = JSON.parse(fs.readFileSync(markerPath(worker), "utf8"));
     return Number.isInteger(marker.pid) && marker.pid > 0 ? marker : null;
   } catch {
     return null;
+  }
+}
+
+// Gives a reserved record up: creates the marker EXCLUSIVELY with abandoned=true, so a launcher that is only
+// now getting scheduled fails its own exclusive create and never starts codex. Returns false when the
+// launcher won the race (its marker exists): the caller adopts that pid instead.
+function abandonLaunch(worker) {
+  try {
+    fs.writeFileSync(markerPath(worker), `${JSON.stringify({ abandoned: true, at: new Date().toISOString() })}\n`, { encoding: "utf8", flag: "wx" });
+    return true;
+  } catch (error) {
+    return error.code !== "EEXIST" || launchMarker(worker) === null; // an existing abandoned marker is ours
   }
 }
 
@@ -236,13 +253,18 @@ function orphanOrFail(state, worker, now, exit) {
 // Returns "resolved" | "pending" | "lost".
 function resolvePid(worker, now) {
   if (worker.pid !== null && worker.pid !== undefined) return "resolved";
-  const marker = launchMarker(worker);
-  if (marker) {
+  const adopt = (marker) => {
     Object.assign(worker, { pid: marker.pid, identityPending: false, identityUnknown: true, pidSource: LAUNCH_MARKER });
     if (worker.status === "starting") worker.status = "running";
     return "resolved";
-  }
-  return now - Date.parse(worker.startedAt) > STARTING_GRACE_MS ? "lost" : "pending";
+  };
+  const marker = launchMarker(worker);
+  if (marker) return adopt(marker);
+  if (now - Date.parse(worker.startedAt) <= STARTING_GRACE_MS) return "pending";
+  // Grace over: claim the marker so a late launcher cannot start; if it beat us to it, track it instead.
+  if (abandonLaunch(worker)) return "lost";
+  const late = launchMarker(worker);
+  return late ? adopt(late) : "lost";
 }
 
 // Brings every non-terminal worker up to date. Terminal only after the process is verifiably gone.
@@ -254,7 +276,7 @@ export async function refreshWorkers(state, { project, layout, now = Date.now(),
     if (worker.status === "retry_pending") {
       if (state.paused || state.stopped) continue;
       await settleResult(state, worker, ctx);
-      changed = worker.status !== "retry_pending" || changed;
+      changed = true; // the budget check refreshed state.rateLimits and retryErrors even when still pending
       continue;
     }
     if (!ACTIVE_STATUSES.has(worker.status)) continue;

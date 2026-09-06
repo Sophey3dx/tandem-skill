@@ -4,15 +4,19 @@
 // stdout/stderr = the log file, both opened by the runner) and appends exactly one JSON line
 // {"type":"tandem.exit","code":…,"signal":…} to the log when codex has exited. No shell is involved.
 //
-// Two guarantees for the zone:
-// - Before anything write-capable exists it writes launched.json (its own pid) next to the log, so a worker
-//   whose runner died between reserving the record and saving the pid can still be found. If the marker
-//   cannot be written, nothing is started (exit 65).
-// - Descendants never outlive the worker: on Windows codex runs inside a Job Object with kill-on-close
-//   (win-job-run.ps1), on POSIX the launcher kills its own process group when codex ends (the runner spawns
-//   it as a group leader and sets TANDEM_LAUNCH_GROUP=1). A worker is reported finished only after that.
+// Guarantees for the zone:
+// - Before anything write-capable exists it creates launched.json (its own pid) next to the log, EXCLUSIVELY
+//   ("wx"). A worker whose runner died between reserving the record and saving the pid is found through it.
+//   If the file cannot be created, nothing is started (exit 65): either the marker is unwritable, or the
+//   runner already gave the record up and left an "abandoned" marker under the same name, so a late launcher
+//   must not start codex into a zone that is free again.
+// - Descendants do not outlive the worker: on Windows codex runs inside a Job Object with kill-on-close
+//   (win-job-run.ps1), which covers every descendant however detached. On POSIX the launcher kills every
+//   process whose parent chain still leads to it and then its own process group (the runner spawns it as a
+//   group leader and sets TANDEM_LAUNCH_GROUP=1); a descendant that started its own session (setsid) is not
+//   covered there, which the documentation states.
 // Usage: node worker-launch.mjs <absolute logFile> <cmd> [args...]
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -34,32 +38,73 @@ function record(entry) {
   }
 }
 
-// Fail-closed: without the marker a runner crash could leave an unregistered write-capable process.
-function mark(extra = {}) {
-  fs.writeFileSync(markerFile, `${JSON.stringify({ pid: process.pid, at: new Date().toISOString(), ...extra })}\n`, "utf8");
+// Fail-closed and exclusive: the first write creates the marker ("wx"); later writes update our own file.
+function mark(extra = {}, { exclusive = false } = {}) {
+  fs.writeFileSync(markerFile, `${JSON.stringify({ pid: process.pid, at: new Date().toISOString(), ...extra })}\n`, { encoding: "utf8", flag: exclusive ? "wx" : "w" });
 }
 
-// POSIX: take every remaining member of the launcher's process group along (codex and all its descendants
-// inherit the group unless they start their own session). Only when the runner made us a group leader.
-function reapGroup() {
-  if (process.platform === "win32" || process.env.TANDEM_LAUNCH_GROUP !== "1") return;
+// POSIX: kill every process whose parent chain still leads to us, then the whole process group (which also
+// covers children reparented to init while their parent lived in our group). Windows: the Job Object did it.
+function reapDescendants() {
+  if (process.platform === "win32") return;
   try {
-    process.kill(-process.pid, "SIGKILL"); // includes ourselves: the exit record is already written
+    const listing = spawnSync("ps", ["-eo", "pid=,ppid="], { encoding: "utf8" }).stdout ?? "";
+    const childrenOf = new Map();
+    for (const line of listing.split("\n")) {
+      const fields = line.trim().split(/\s+/).map(Number);
+      if (fields.length !== 2 || !fields.every(Number.isInteger)) continue;
+      const [pid, ppid] = fields;
+      if (!childrenOf.has(ppid)) childrenOf.set(ppid, []);
+      childrenOf.get(ppid).push(pid);
+    }
+    const stack = [process.pid];
+    const descendants = [];
+    while (stack.length > 0) {
+      for (const pid of childrenOf.get(stack.pop()) ?? []) {
+        descendants.push(pid);
+        stack.push(pid);
+      }
+    }
+    for (const pid of descendants) {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {
+        // already gone
+      }
+    }
   } catch {
-    // group already empty
+    // ps unavailable: the group kill below is all we can do
+  }
+  if (process.env.TANDEM_LAUNCH_GROUP === "1") {
+    try {
+      process.kill(-process.pid, "SIGKILL"); // includes ourselves: the exit record is already written
+    } catch {
+      // group already empty
+    }
   }
 }
 
 function leave(entry, code) {
   record(entry);
-  reapGroup();
+  reapDescendants();
   process.exit(code);
 }
 
 try {
-  mark();
+  mark({}, { exclusive: true });
 } catch (error) {
-  record({ code: 65, signal: null, error: `launch marker not writable: ${error.message}` });
+  let reason = `launch marker not writable: ${error.message}`;
+  if (error.code === "EEXIST") {
+    try {
+      // The runner gave the record up (abandoned marker), or something else already sits there: never start.
+      reason = JSON.parse(fs.readFileSync(markerFile, "utf8")).abandoned === true
+        ? "launch abandoned by the runner (marker already present)"
+        : "launch marker already present (EEXIST)";
+    } catch {
+      // a directory or garbage in the marker's place: reported as not writable
+    }
+  }
+  record({ code: 65, signal: null, error: reason });
   process.exit(65);
 }
 
@@ -87,7 +132,7 @@ try {
 try {
   mark({ childPid: child.pid ?? null, job: useJob });
 } catch {
-  // the first marker is in place; the child pid is a convenience
+  // the exclusive marker is in place; the child pid is a convenience
 }
 
 let reported = false;

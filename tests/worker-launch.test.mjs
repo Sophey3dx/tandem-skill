@@ -33,10 +33,10 @@ test("the launcher passes stdio through, writes launched.json and appends the ch
   const logFile = path.join(dir, "log.txt");
   // With `node -e`, process.argv[1] is already the first extra argument.
   const script = "process.stdout.write(require('fs').readFileSync(0,'utf8').toUpperCase() + ' ' + JSON.stringify(process.argv.slice(1)) + '\\n'); process.stderr.write('err-line\\n'); process.exit(5)";
-  const result = launch(logFile, process.execPath, ["-e", script, "a b", "q\"uote", "back\\slash\\", "%PATH%"], { stdinText: "brief text" });
+  const result = launch(logFile, process.execPath, ["-e", script, "a b", "q\"uote", "back\\slash\\", "%PATH%", "-"], { stdinText: "brief text" });
   assert.equal(result.status, 5, "the launcher exits with the child's code");
   const text = fs.readFileSync(logFile, "utf8");
-  assert.match(text, /^BRIEF TEXT \["a b","q\\"uote","back\\\\slash\\\\","%PATH%"\]\r?\n/, "stdin reached the child, arguments arrived verbatim, stdout reached the log");
+  assert.match(text, /^BRIEF TEXT \["a b","q\\"uote","back\\\\slash\\\\","%PATH%","-"\]\r?\n/, "stdin reached the child, arguments (incl. a bare dash) arrived verbatim, stdout reached the log");
   assert.match(text, /err-line/, "stderr reached the log");
   const exit = exitRecord(logFile);
   assert.deepEqual({ code: exit.code, signal: exit.signal }, { code: 5, signal: null });
@@ -47,11 +47,14 @@ test("the launcher passes stdio through, writes launched.json and appends the ch
   assert.equal(marker.job, process.platform === "win32");
 });
 
-test("no descendant outlives the worker: a detached grandchild is killed when the child exits", async () => {
+test("no descendant outlives the worker: a grandchild orphaned by its parent is killed when the child exits", async () => {
   const dir = makeProject("launch-tree");
   const logFile = path.join(dir, "log.txt");
   const late = path.join(dir, "late.txt");
-  const probe = `const { spawn } = require("node:child_process"); const g = spawn(process.execPath, ["-e", "setTimeout(() => require('fs').writeFileSync(" + JSON.stringify(${JSON.stringify(late)}) + ", 'late'), 3000)"], { detached: true, stdio: "ignore", windowsHide: true }); g.unref(); process.stdout.write("grandchild " + g.pid + "\\n"); process.exit(0)`;
+  // Windows: even a detached grandchild dies with the Job Object. POSIX: the process group covers a grandchild
+  // that stays in the group (a setsid escapee is a documented limitation there).
+  const detached = process.platform === "win32";
+  const probe = `const { spawn } = require("node:child_process"); const g = spawn(process.execPath, ["-e", "setTimeout(() => require('fs').writeFileSync(" + JSON.stringify(${JSON.stringify(late)}) + ", 'late'), 3000)"], { detached: ${detached}, stdio: "ignore", windowsHide: true }); g.unref(); process.stdout.write("grandchild " + g.pid + "\\n"); process.exit(0)`;
   // detached + TANDEM_LAUNCH_GROUP mirror how the runner starts the launcher (POSIX group leader).
   const stdinFile = path.join(dir, "stdin.txt");
   fs.writeFileSync(stdinFile, "", "utf8");
@@ -80,6 +83,18 @@ test("without a writable launch marker nothing is started (fail-closed, exit 65)
   const exit = exitRecord(logFile);
   assert.equal(exit.code, 65);
   assert.match(exit.error, /launch marker not writable/);
+});
+
+test("a launcher that finds the record abandoned by the runner does not start (exclusive marker)", () => {
+  const dir = makeProject("launch-abandoned");
+  const logFile = path.join(dir, "log.txt");
+  fs.writeFileSync(path.join(dir, "launched.json"), JSON.stringify({ abandoned: true, at: new Date().toISOString() }), "utf8");
+  const witness = path.join(dir, "started.txt");
+  const result = launch(logFile, process.execPath, ["-e", `require('fs').writeFileSync(${JSON.stringify(witness)}, 'started')`]);
+  assert.equal(result.status, 65);
+  assert.equal(fs.existsSync(witness), false, "a late launcher never starts codex into a zone that is free again");
+  assert.match(exitRecord(logFile).error, /abandoned by the runner/);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dir, "launched.json"), "utf8")).abandoned, true, "the runner's marker is untouched");
 });
 
 test("the launcher reports a command that cannot be started (no shell, no throw) as exit 127", () => {

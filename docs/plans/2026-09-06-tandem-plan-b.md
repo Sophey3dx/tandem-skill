@@ -298,11 +298,20 @@ test(".tandem is off limits except .tandem/design/<N>; shared folders are reject
   assert.equal(code(() => checkZone({ project, zone: zoneIn(project, ".tandem") })), "bad_zone");
   assert.equal(code(() => checkZone({ project, zone: zoneIn(project, ".tandem/design") })), "bad_zone");
   same(checkZone({ project, zone: zoneIn(project, ".tandem/design/1/codex") }), path.join(project, ".tandem/design/1/codex"));
+  assert.equal(code(() => checkZone({ project, zone: zoneIn(project, ".tandem/design/1/claude") })), "bad_zone", "only the codex variant is a zone");
+  assert.equal(code(() => checkZone({ project, zone: zoneIn(project, ".tandem/design/1/codex/sub") })), "bad_zone", "exactly <N>/codex");
+  assert.equal(code(() => checkZone({ project, zone: zoneIn(project, ".tandem/design/x/codex") })), "bad_zone", "<N> must be a number");
   assert.equal(code(() => checkZone({ project, zone: zoneIn(project, "node_modules/pkg") })), "bad_zone");
   assert.equal(code(() => checkZone({ project, zone: zoneIn(project, ".git/hooks") })), "bad_zone");
   const withCache = zoneIn(project, "app");
   zoneIn(project, "app/dist");
   assert.equal(code(() => checkZone({ project, zone: withCache })), "bad_zone");
+  if (process.platform === "win32") {
+    const upper = zoneIn(project, "app2");
+    zoneIn(project, "app2/Dist");
+    assert.equal(code(() => checkZone({ project, zone: upper })), "bad_zone", "case-insensitive on Windows");
+    assert.equal(code(() => checkZone({ project, zone: zoneIn(project, "NODE_MODULES/x") })), "bad_zone");
+  }
 });
 
 test("reparse points inside the zone, as the zone, or in an ancestor are rejected", () => {
@@ -376,7 +385,7 @@ function walk(root) {
       const full = path.join(dir, entry.name);
       if (entry.isSymbolicLink()) throw bad(`Zone contains a symlink or junction: ${full}`, "Remove it or choose another zone.");
       if (entry.isDirectory()) {
-        if (FORBIDDEN_DIR_NAMES.has(entry.name)) throw bad(`Zone contains a shared build/cache/VCS folder: ${full}`, "Workers must not touch node_modules, dist, build, .next, target or .git.");
+        if (FORBIDDEN_DIR_NAMES.has(lower(entry.name))) throw bad(`Zone contains a shared build/cache/VCS folder: ${full}`, "Workers must not touch node_modules, dist, build, .next, target or .git.");
         stack.push(full);
       }
     }
@@ -411,12 +420,14 @@ export function checkZone({ project, zone, activeZones = [] }) {
   if (isUnderTemp(realZone)) throw bad(`Zone resolves under a TEMP directory: ${realZone}`);
   const layout = tandemLayout(realProject);
   if (isUnder(realZone, layout.root)) {
-    if (!isUnder(realZone, layout.design) || canonical(realZone) === canonical(layout.design) || path.relative(layout.design, realZone).split(/[\\/]+/).length < 2) {
-      throw bad(`Zone must not lie inside .tandem/ (only .tandem/design/<N>/<variant> is allowed): ${realZone}`);
+    // The only zones allowed under .tandem/ are design rounds' Codex variants: .tandem/design/<N>/codex
+    const parts = isUnder(realZone, layout.design) && canonical(realZone) !== canonical(layout.design) ? path.relative(layout.design, realZone).split(/[\\/]+/) : [];
+    if (parts.length !== 2 || !/^\d+$/.test(parts[0]) || lower(parts[1]) !== "codex") {
+      throw bad(`Zone must not lie inside .tandem/ (only .tandem/design/<N>/codex is allowed): ${realZone}`);
     }
   }
   for (const segment of path.relative(realProject, realZone).split(/[\\/]+/)) {
-    if (FORBIDDEN_DIR_NAMES.has(segment)) throw bad(`Zone lies inside a shared build/cache/VCS folder (${segment}): ${realZone}`, "Zones must not touch node_modules, dist, build, .next, target or .git.");
+    if (FORBIDDEN_DIR_NAMES.has(lower(segment))) throw bad(`Zone lies inside a shared build/cache/VCS folder (${segment}): ${realZone}`, "Zones must not touch node_modules, dist, build, .next, target or .git.");
   }
   for (const active of activeZones) {
     if (isUnder(realZone, active) || isUnder(active, realZone)) throw bad(`Zone overlaps an active worker zone: ${active}`, "Wait for that worker (`worker wait <id>`) or choose a disjoint folder.");
@@ -455,10 +466,10 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: `checkZone`, `MAX_ACTIVE_WORKERS` (Task 2), Schema `worker-result` (Task 1), `resolveCodex`, `killTree`, `parseJsonl`, `classifyFailure`, `threadIdFromEvents`, `buildResumeArgs`, `runCodex`, `minutes`, `normalizeEffort` (codex), `guardActive` (exchange), `ensureBudget`, `minRemainingOf` (ratelimits), `renderTemplate`, `loadState`, `saveState`, `withLock`, `addUsage`, `pidAlive` (state), `extractUsage`.
-- Produces (procs.mjs): `processStartTime(pid) → epochMs|null`, `sameProcess({ pid, procStart }) → boolean` (false wenn weg oder Startzeit weicht > 5 s ab; `procStart == null` ⇒ nur pidAlive), `sleepSync(ms)`.
-- Produces (workers.mjs): `TERMINAL_STATUSES`, `ACTIVE_STATUSES` (`running`, `finishing`, `killing`), `REQUIRED_BRIEF_SECTIONS` (10 Überschriften), `missingBriefSections(brief)`, `buildWorkerArgs({ zone, effort, outFile, model })`, `spawnDetachedCodex({ args, stdinFile, logFile, cwd, env }) → { pid, procStart }`, `killWorker(worker, env) → { gone: boolean }` (verifiziert Identität vor dem Kill und wartet bis 5 s auf das Ende), `refreshWorkers(state, { project, layout, now, env }) → Promise<boolean>` (async; enthält den Schema-Retry), `bookWorkerUsage(state, worker)`, `cancelWorker(state, worker, env) → { gone }`, `activeZones(state)`, `workerView(worker)`.
-- Worker-Datensatz: `{ id, zone, pid, procStart, effort, model, status, startedAt, deadlineAt, briefPath, resultPath, logPath, usageBooked, killReason?, killFailed?, retried?, result?, errors?, failure?, finishedAt? }`; Zähler `state.workerSeq`.
-- Zustände: `running` → (`finishing` wenn Ergebnis vorhanden, Prozess lebt) → `done|partial|blocked` (Prozess weg, Ergebnis gültig) | `invalid_output` (nach Retry) ; `running` → `killing` (Deadline/Cancel, Kill nicht bestätigt) → `timeout|cancelled` (Prozess weg) ; `running` → `orphaned|failed` (Prozess weg ohne Ergebnis; `failed` mit `failure` aus dem Log, `quota` pausiert tandem).
+- Produces (procs.mjs): `processStartTime(pid) → epochMs|null`, `captureStartTime(pid, { attempts = 10, waitMs = 200 }) → epochMs|null` (wiederholt die Erfassung direkt nach dem Spawn), `sameProcess({ pid, procStart }) → boolean` (PID lebt **und** Startzeit passt ± 5 s; `procStart == null` ⇒ nur Lebendigkeit, nie Identität), `sleepSync(ms)`.
+- Produces (workers.mjs): `TERMINAL_STATUSES`, `ACTIVE_STATUSES` (`running`, `finishing`, `killing`), `REQUIRED_BRIEF_SECTIONS` (10 Überschriften), `missingBriefSections(brief)`, `buildWorkerArgs({ zone, effort, outFile, model })`, `spawnDetachedCodex({ args, stdinFile, logFile, cwd, env }) → { pid, procStart }` (procStart mit Wiederholungen erfasst), `killWorker(worker, env) → { gone: boolean, reason?: "identity_unknown" }` (**tötet nie ohne verifizierte Startzeit**; wartet bis 5 s auf das Ende), `refreshWorkers(state, { project, layout, now, env }) → Promise<boolean>` (async; enthält den Schema-Retry), `bookWorkerUsage(state, worker)`, `cancelWorker(state, worker, env) → { gone }`, `activeZones(state)`, `workerView(worker)`.
+- Worker-Datensatz: `{ id, zone, pid, procStart, identityUnknown?, effort, model, status, startedAt, deadlineAt, briefPath, resultPath, logPath, usageBooked, killReason?, killFailed?, retried?, retryErrors?, result?, errors?, failure?, finishedAt? }`; Zähler `state.workerSeq`. `procStart` wird **nie** nachträglich vom aktuellen PID-Inhaber übernommen.
+- Zustände: `running` → (`finishing` wenn Ergebnis vorhanden, Prozess lebt) → `done|partial|blocked` (Prozess weg, Ergebnis gültig) | `retry_pending` (Ergebnis ungültig, Budget hat den Retry abgelehnt; nicht terminal, Zone frei, Retry beim nächsten Refresh) | `invalid_output` (nach Retry) ; `running` → `killing` (Deadline/Cancel, Kill nicht bestätigt oder Identität unbekannt) → `timeout|cancelled` (Prozess weg) ; `running` → `orphaned|failed` (Prozess weg ohne Ergebnis; `failed` mit `failure` aus dem Log, `quota` pausiert tandem). Ein fehlgeschlagener Retry-Modellaufruf endet `failed` mit `failure` und derselben Quota-Policy (`noteFailure`).
 - Befehl: `worker start --zone <abs> --brief-file <abs> [--effort medium] [--deadline-min 20] [--model <name>] [--min-remaining] [--force]` → `{ worker, activeWorkers }`; `worker status [id]` → `{ workers, active }`; `worker wait <id> [--poll-sec 5] [--timeout-min]` → `{ worker, waitedMs, timedOutWaiting? }`; `worker cancel <id>` → `{ worker, gone }`.
 
 - [ ] **Step 1: `pidAlive` exportieren** (`scripts/lib/state.mjs`)
@@ -472,17 +483,18 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { processStartTime, sameProcess, sleepSync } from "../scripts/lib/procs.mjs";
+import { captureStartTime, processStartTime, sameProcess, sleepSync } from "../scripts/lib/procs.mjs";
 
 test("processStartTime reports the start of a live process and null for a dead pid", async () => {
   const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 4000)"], { stdio: "ignore" });
-  sleepSync(300);
-  const start = processStartTime(child.pid);
-  assert.ok(Number.isFinite(start), "start time must be a number");
+  const start = captureStartTime(child.pid);
+  assert.ok(Number.isFinite(start), "start time must be captured right after spawn");
+  assert.equal(processStartTime(child.pid), start);
   assert.ok(Math.abs(Date.now() - start) < 60 * 1000, "start time must be recent");
   assert.equal(sameProcess({ pid: child.pid, procStart: start }), true);
   assert.equal(sameProcess({ pid: child.pid, procStart: start - 60 * 1000 }), false, "a different start time means a different process");
-  assert.equal(sameProcess({ pid: child.pid, procStart: null }), true, "unknown identity falls back to pid liveness");
+  assert.equal(sameProcess({ pid: child.pid, procStart: null }), true, "unknown identity only tells liveness (callers must never kill on it)");
+  assert.equal(captureStartTime(999999, { attempts: 2, waitMs: 10 }), null);
   child.kill();
   await new Promise((resolve) => child.on("exit", resolve));
   sleepSync(200);
@@ -516,7 +528,19 @@ export function processStartTime(pid) {
   return Number.isFinite(ms) ? ms : null;
 }
 
-// True only when the pid is alive AND (identity unknown, or the start time matches within 5 s).
+// Right after a spawn the process may not be visible yet; retry briefly. Returns null when it never was.
+export function captureStartTime(pid, { attempts = 10, waitMs = 200 } = {}) {
+  for (let i = 0; i < attempts; i += 1) {
+    const start = processStartTime(pid);
+    if (start !== null) return start;
+    if (!pidAlive(pid)) return null;
+    sleepSync(waitMs);
+  }
+  return null;
+}
+
+// True only when the pid is alive AND the start time matches within 5 s. With an unknown identity
+// (procStart null) this only reports liveness; callers must never kill on that basis.
 export function sameProcess({ pid, procStart }) {
   if (!pidAlive(pid)) return false;
   if (procStart === null || procStart === undefined) return true;
@@ -538,7 +562,7 @@ Run: `node --test tests/procs.test.mjs` → Expected `# pass 1`.
 - Du arbeitest ausschließlich in der Zone. Die Sandbox erlaubt Schreiben nur dort; Schreibversuche außerhalb schlagen fehl und sind nicht erwünscht. Lesen darfst du das ganze Projekt.
 - Kein `git commit`, kein `git push`, keine Änderungen an gemeinsamen Build- oder Cache-Ordnern, keine Paketinstallation.
 - Halte dich an die erlaubten Dateien, die Löschrechte und die Stop-Bedingungen des Auftrags. Bei Unklarheit nicht raten, sondern BLOCKED melden und die Frage in `blockers` stellen.
-- Führe die Akzeptanztests aus, soweit sie in der Zone laufen, und nenne Befehle mit Exitcodes.
+- Führe die Akzeptanztests aus, soweit sie in der Zone laufen, und nenne Befehle mit Exitcodes. Ausnahme zur Zonenregel: verlangt der Auftrag unter Akzeptanztests ausdrücklich eine Sandbox-Probe (einen Schreibversuch außerhalb der Zone, der scheitern soll), führe genau diese Probe aus, trage den Befehl mit seinem Exitcode in `tests` ein und beschreibe die Fehlermeldung in `notes`.
 - Antworte am Ende ausschließlich als JSON nach dem Schema worker-result, ohne Text davor oder danach: `status` DONE|PARTIAL|BLOCKED, `touchedFiles` (Pfade relativ zur Zone), `tests` [{cmd, exitCode}], `remaining`, `blockers` [{text, evidence}], `notes`. DONE nur ohne Restarbeit und ohne Blocker.
 ```
 
@@ -591,7 +615,7 @@ test("worker start validates brief and zone, spawns detached; wait returns DONE 
   assert.equal(started.json.ok, true, JSON.stringify(started.json));
   assert.equal(started.json.worker.id, "W1");
   assert.equal(started.json.worker.status, "running");
-  assert.ok(Number.isFinite(started.json.worker.procStart) || started.json.worker.procStart === null);
+  assert.ok(Number.isFinite(started.json.worker.procStart), "identity captured at spawn");
   assert.equal(started.json.activeWorkers, 1);
   const waited = runTandem(["worker", "wait", "W1", "--poll-sec", "1"], { cwd: dir });
   assert.equal(waited.json.worker.status, "done", JSON.stringify(waited.json));
@@ -668,6 +692,30 @@ test("an invalid result is retried exactly once by resuming the worker thread (r
   assert.equal(still.json.worker.retried, true);
 });
 
+test("a budget refusal before the retry leaves it pending (not consumed); a quota failure of the retry pauses tandem", () => {
+  const { dir, zone, brief, logFile } = prepared("worker-retry-budget");
+  const onceFlag = path.join(dir, "invalid-once.flag");
+  // Budget queries in order: start (18 % → ok), first retry attempt (97 % → refused, pending), second attempt (18 % → ok).
+  const env = { FAKE_CODEX_LOG: logFile, FAKE_WORKER_INVALID_ONCE: onceFlag, FAKE_USED_PRIMARY_SEQUENCE: "18,97,18" };
+  const w1 = runTandem(["worker", "start", "--zone", zone, "--brief-file", brief], { cwd: dir, env });
+  const pending = runTandem(["worker", "wait", w1.json.worker.id, "--poll-sec", "1"], { cwd: dir, env });
+  assert.equal(pending.json.worker.status, "retry_pending", JSON.stringify(pending.json));
+  assert.notEqual(pending.json.worker.retried, true, "a refused retry is not consumed");
+  assert.equal(readLog(logFile).filter((c) => c.argv[1] === "resume").length, 0, "no model call while the budget refuses");
+  assert.equal(runTandem(["worker", "status"], { cwd: dir, env }).json.active, 0, "zone is free while pending");
+  const done = runTandem(["worker", "status", w1.json.worker.id], { cwd: dir, env });
+  assert.equal(done.json.workers[0].status, "done", JSON.stringify(done.json));
+  assert.equal(done.json.workers[0].retried, true);
+  assert.equal(readLog(logFile).filter((c) => c.argv[1] === "resume").length, 1);
+  const zone2 = path.join(dir, "zone2");
+  fs.mkdirSync(zone2);
+  const w2 = runTandem(["worker", "start", "--zone", zone2, "--brief-file", brief], { cwd: dir, env: { FAKE_WORKER_INVALID: "1" } });
+  const failed = runTandem(["worker", "wait", w2.json.worker.id, "--poll-sec", "1"], { cwd: dir, env: { FAKE_WORKER_INVALID: "1", FAKE_CODEX_MODE: "quota" } });
+  assert.equal(failed.json.worker.status, "failed");
+  assert.equal(failed.json.worker.failure, "quota");
+  assert.equal(stateOf(dir).paused, true, "the retry's quota failure pauses tandem like any other call");
+});
+
 test("max two active workers, overlapping zones rejected, cancel verifies the kill, status counts", () => {
   const { dir, zone, brief } = prepared("worker-limit");
   const zoneB = path.join(dir, "zoneB");
@@ -715,6 +763,26 @@ test("a failed kill keeps the worker active as 'killing' and the zone reserved; 
   killTree(pid); // clean up the (still running) fake tree ourselves
 });
 
+test("a worker without a captured identity is never killed and its identity is never filled in later", () => {
+  const { dir, zone, brief } = prepared("worker-identity");
+  const a = runTandem(["worker", "start", "--zone", zone, "--brief-file", brief, "--deadline-min", "5"], { cwd: dir, env: { FAKE_CODEX_MODE: "hang" } });
+  assert.equal(a.json.ok, true);
+  const state = stateOf(dir);
+  state.workers[0].procStart = null; // as if Get-Process/ps had failed at spawn
+  fs.writeFileSync(path.join(dir, ".tandem", "state.json"), JSON.stringify(state, null, 2));
+  const cancelled = runTandem(["worker", "cancel", "W1"], { cwd: dir });
+  assert.equal(cancelled.json.gone, false);
+  assert.equal(cancelled.json.worker.status, "killing");
+  assert.equal(cancelled.json.worker.killBlockedBy, "identity_unknown");
+  const status = runTandem(["worker", "status", "W1"], { cwd: dir });
+  assert.equal(status.json.workers[0].procStart, null, "identity is never adopted from the current pid owner");
+  assert.equal(status.json.workers[0].identityUnknown, true);
+  assert.equal(status.json.active, 1, "zone stays reserved");
+  killTree(state.workers[0].pid); // clean up ourselves
+  sleepSync(500);
+  assert.equal(runTandem(["worker", "status", "W1"], { cwd: dir }).json.workers[0].status, "cancelled", "terminal once the process is gone");
+});
+
 test("worker start is blocked by the budget guard and by stop; --model is validated and passed through", () => {
   const { dir, zone, brief, logFile } = prepared("worker-guard");
   assert.equal(runTandem(["worker", "start", "--zone", zone, "--brief-file", brief], { cwd: dir, env: { FAKE_USED_PRIMARY: "97" } }).json.error, "quota_low");
@@ -752,8 +820,9 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { buildResumeArgs, classifyFailure, killTree, parseJsonl, resolveCodex, runCodex, threadIdFromEvents } from "./codex.mjs";
+import { noteFailure } from "./exchange.mjs";
 import { TandemError } from "./output.mjs";
-import { processStartTime, sameProcess, sleepSync } from "./procs.mjs";
+import { captureStartTime, sameProcess, sleepSync } from "./procs.mjs";
 import { ensureBudget } from "./ratelimits.mjs";
 import { parseReplyFile, schemaPath } from "./schema.mjs";
 import { addUsage } from "./state.mjs";
@@ -810,7 +879,7 @@ export function spawnDetachedCodex({ args, stdinFile, logFile, cwd, env = proces
     child = spawn("/bin/sh", ["-c", line], { cwd, env, detached: true, stdio: "ignore" });
   }
   child.unref();
-  return { pid: child.pid, procStart: processStartTime(child.pid) };
+  return { pid: child.pid, procStart: captureStartTime(child.pid) };
 }
 
 function readLogText(logPath) {
@@ -835,8 +904,12 @@ function finish(state, worker, status, now, extra = {}) {
   bookWorkerUsage(state, worker);
 }
 
-// Kills only a process that is verifiably ours, then waits up to KILL_CONFIRM_MS for it to disappear.
+// Kills only a process that is verifiably ours (pid AND start time), then waits up to KILL_CONFIRM_MS for it
+// to disappear. Without a verified identity nothing is ever killed.
 export function killWorker(worker, env = process.env) {
+  if (worker.procStart === null || worker.procStart === undefined) {
+    return sameProcess(worker) ? { gone: false, killed: false, reason: "identity_unknown" } : { gone: true, killed: false };
+  }
   if (!sameProcess(worker)) return { gone: true, killed: false };
   killTree(worker.pid, env);
   const until = Date.now() + KILL_CONFIRM_MS;
@@ -848,16 +921,21 @@ export function killWorker(worker, env = process.env) {
 }
 
 // Exactly one schema retry for an invalid result: resume the worker's own thread read-only and ask for the
-// JSON report only. Budget-checked like every model call. Returns the parsed result or null.
+// JSON report only. Budget-checked like every model call; a budget refusal leaves the retry pending (it is
+// attempted again on the next refresh), a model failure ends the worker with that failure and the usual
+// quota policy. Returns { parsed, errors, pending?, failure? }.
 async function retryWorkerResult(state, worker, { project, layout, env }) {
-  worker.retried = true;
   const threadId = threadIdFromEvents(parseJsonl(readLogText(worker.logPath)));
-  if (!threadId) return { parsed: null, errors: ["no thread id in the worker log; cannot resume"] };
+  if (!threadId) {
+    worker.retried = true;
+    return { parsed: null, errors: ["no thread id in the worker log; cannot resume"] };
+  }
   try {
     await ensureBudget(state, { env });
   } catch (error) {
-    return { parsed: null, errors: [`retry skipped: ${error.code} ${error.message}`] };
+    return { parsed: null, errors: [`retry pending: ${error.code} ${error.message}`], pending: true };
   }
+  worker.retried = true; // the model call happens now
   const promptFile = path.join(layout.workers, worker.id, "retry.md");
   fs.writeFileSync(promptFile, "Deine Abschlussmeldung war nicht schema-konform. Führe KEINE weitere Arbeit aus. Gib jetzt ausschließlich die JSON-Abschlussmeldung nach dem Schema worker-result aus (status DONE|PARTIAL|BLOCKED, touchedFiles, tests, remaining, blockers, notes), ohne Text davor oder danach.\n", "utf8");
   const result = await runCodex({
@@ -865,16 +943,40 @@ async function retryWorkerResult(state, worker, { project, layout, env }) {
     promptFile, cwd: project, timeoutMs: RETRY_DEADLINE_MS, env, logFile: path.join(layout.workers, worker.id, "retry.log")
   });
   addUsage(state, "worker", extractUsage(result));
-  if (result.failure) return { parsed: null, errors: [`retry failed: ${result.failure}`] };
+  if (result.failure) {
+    noteFailure(state, result);
+    return { parsed: null, errors: [`retry failed: ${result.failure}`], failure: result.failure };
+  }
   return parseReplyFile(worker.resultPath, "worker-result");
 }
 
-// Brings every active worker up to date. Terminal only after the process is verifiably gone.
+async function settleResult(state, worker, { project, layout, env, now }) {
+  let outcome = parseReplyFile(worker.resultPath, "worker-result");
+  if (!outcome.parsed && !worker.retried) outcome = await retryWorkerResult(state, worker, { project, layout, env });
+  if (outcome.parsed) {
+    finish(state, worker, outcome.parsed.status.toLowerCase(), now, { result: outcome.parsed });
+  } else if (outcome.pending) {
+    worker.status = "retry_pending"; // not terminal, zone free; retried on the next refresh
+    worker.retryErrors = outcome.errors;
+  } else if (outcome.failure) {
+    finish(state, worker, "failed", now, { failure: outcome.failure, errors: outcome.errors });
+  } else {
+    finish(state, worker, "invalid_output", now, { errors: outcome.errors });
+  }
+}
+
+// Brings every non-terminal worker up to date. Terminal only after the process is verifiably gone.
 export async function refreshWorkers(state, { project, layout, now = Date.now(), env = process.env } = {}) {
   let changed = false;
   for (const worker of state.workers ?? []) {
+    if (worker.status === "retry_pending") {
+      await settleResult(state, worker, { project, layout, env, now });
+      changed = worker.status !== "retry_pending" || changed;
+      continue;
+    }
     if (!ACTIVE_STATUSES.has(worker.status)) continue;
-    if (worker.procStart === null || worker.procStart === undefined) worker.procStart = processStartTime(worker.pid);
+    // procStart is never taken over from the current pid owner later; an unknown identity stays unknown.
+    if (worker.procStart === null || worker.procStart === undefined) worker.identityUnknown = true;
     const alive = sameProcess(worker);
     const hasResult = fs.existsSync(worker.resultPath);
     if (worker.status === "killing") {
@@ -890,17 +992,14 @@ export async function refreshWorkers(state, { project, layout, now = Date.now(),
       } else if (now > Date.parse(worker.deadlineAt)) {
         const kill = killWorker(worker, env);
         if (kill.gone) finish(state, worker, "timeout", now, { killReason: "timeout" });
-        else Object.assign(worker, { status: "killing", killReason: "timeout", killFailed: true });
+        else Object.assign(worker, { status: "killing", killReason: "timeout", killFailed: true, killBlockedBy: kill.reason ?? "kill_failed" });
         changed = true;
       }
       continue;
     }
     // Process gone.
     if (hasResult) {
-      let { parsed, errors } = parseReplyFile(worker.resultPath, "worker-result");
-      if (!parsed && !worker.retried) ({ parsed, errors } = await retryWorkerResult(state, worker, { project, layout, env }));
-      if (parsed) finish(state, worker, parsed.status.toLowerCase(), now, { result: parsed });
-      else finish(state, worker, "invalid_output", now, { errors });
+      await settleResult(state, worker, { project, layout, env, now });
     } else {
       const failure = classifyFailure({ status: 1, timedOut: false, stderr: readLogText(worker.logPath) });
       if (failure === "quota") state.paused = true;
@@ -912,10 +1011,14 @@ export async function refreshWorkers(state, { project, layout, now = Date.now(),
 }
 
 export function cancelWorker(state, worker, env = process.env) {
+  if (worker.status === "retry_pending") {
+    finish(state, worker, "cancelled", Date.now(), { killReason: "cancelled", killFailed: false });
+    return { gone: true, changed: true };
+  }
   if (!ACTIVE_STATUSES.has(worker.status)) return { gone: true, changed: false };
   const kill = killWorker(worker, env);
   if (kill.gone) finish(state, worker, "cancelled", Date.now(), { killReason: "cancelled", killFailed: false });
-  else Object.assign(worker, { status: "killing", killReason: "cancelled", killFailed: true });
+  else Object.assign(worker, { status: "killing", killReason: "cancelled", killFailed: true, killBlockedBy: kill.reason ?? "kill_failed" });
   return { gone: kill.gone, changed: true };
 }
 
@@ -1068,7 +1171,7 @@ Import `import { runWorker } from "./commands/worker.mjs";` und in `COMMANDS`: `
 - [ ] **Step 9: Tests laufen lassen, Erfolg prüfen**
 
 Run: `node --test tests/procs.test.mjs tests/worker.test.mjs`
-Expected: `# pass 9`, `# fail 0` (Linger-, Timeout- und Kill-Fälle dauern zusammen ~20 s).
+Expected: `# pass 11`, `# fail 0` (Linger-, Timeout- und Kill-Fälle dauern zusammen ~30 s).
 
 - [ ] **Step 10: Commit**
 
@@ -1599,8 +1702,8 @@ fs.writeFileSync(brief, [
   "## Nicht-Ziele", "Keine anderen Dateien in der Zone.",
   "## Erlaubte Dateien", "- hello.txt",
   "## Schnittstellen", "keine",
-  "## Akzeptanztests", "- hello.txt existiert und enthält hello",
-  "- Sandbox-Probe: versuche zusätzlich, die Datei ../leak.txt (eine Ebene über der Zone) mit dem Inhalt leak anzulegen. Erwartung: das schlägt fehl. Melde in notes, ob es blockiert wurde.",
+  "## Akzeptanztests", "- hello.txt existiert und enthält exakt hello",
+  "- Sandbox-Probe (ausdrücklich erlaubt und Pflichtteil dieses Auftrags): führe den Befehl `node -e \"require('fs').writeFileSync('../leak.txt','leak')\"` in der Zone aus. Erwartung: er schlägt fehl. Trage genau diesen Befehl mit seinem Exitcode in `tests` ein und zitiere die Fehlermeldung in `notes`. Melde DONE nur, wenn die Probe fehlgeschlagen ist.",
   "## Löschrechte", "keine",
   "## Stop-Bedingungen", "Bei Unklarheit BLOCKED.",
   "## Kontext aus dem Ledger", "Wegwerf-Projekt, keine Konventionen."
@@ -1609,11 +1712,17 @@ const started = run(["worker", "start", "--zone", zone, "--brief-file", brief, "
 if (!started.ok) fail("worker start failed");
 const waited = run(["worker", "wait", started.worker.id, "--poll-sec", "3"]);
 if (!waited.ok || waited.worker.status !== "done") fail(`worker ended as ${waited.worker?.status}`);
-const hello = fs.existsSync(path.join(zone, "hello.txt")) ? fs.readFileSync(path.join(zone, "hello.txt"), "utf8").trim() : null;
-if (hello !== "hello") fail(`zone content wrong: ${JSON.stringify(hello)}`);
+const helloPath = path.join(zone, "hello.txt");
+if (!fs.existsSync(helloPath) || !fs.readFileSync(helloPath).equals(Buffer.from("hello"))) fail("zone content is not exactly the bytes 'hello'");
+const zoneEntries = fs.readdirSync(zone).sort();
+if (zoneEntries.join(",") !== "hello.txt") fail(`zone contains unexpected entries: ${zoneEntries.join(", ")}`);
 if (fs.existsSync(path.join(project, "leak.txt"))) fail("sandbox leak: ../leak.txt was written outside the zone");
-console.log("notes:", waited.worker.result.notes);
-console.log("SMOKE OK: lane answered, worker DONE, zone content exact, no leak outside the zone");
+const probe = (waited.worker.result.tests ?? []).find((t) => /leak\.txt/.test(t.cmd));
+if (!probe) fail("the worker did not run the sandbox probe (no leak.txt command in tests)");
+if (probe.exitCode === 0) fail(`the sandbox probe succeeded (exit 0): ${probe.cmd}`);
+if (!/denied|EPERM|EACCES|blocked|verweigert|fehlgeschlagen|failed|error/i.test(waited.worker.result.notes ?? "")) fail(`notes do not describe the blocked probe: ${waited.worker.result.notes}`);
+console.log("probe:", probe.cmd, "→ exit", probe.exitCode);
+console.log("SMOKE OK: lane answered, worker DONE, zone content exact, probe blocked, no leak outside the zone");
 ```
 
 - [ ] **Step 6: Gesamte Suite, Zahl eintragen, Commit**
@@ -1635,6 +1744,12 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 2. Smoke gegen echtes Codex auf Zuruf: `node tests/smoke-workers.mjs C:\Users\david\tandem-smoke` (low effort), danach Ordner löschen. Prüft `codex exec fork --ephemeral` mit Schema (Spec 12.2), einen echten Worker in einer Zone und den sicheren Isolations-Negativtest (`../leak.txt` muss blockiert werden).
 3. Abschluss nach Spec 4.5 mit tandem selbst: `review --base main` auf dem Branch und `contact --kind final` auf dem Dauer-Thread des Skill-Repos; echte Befunde fixen, bis das Schlussurteil OK ist.
 4. Merge nach `main`, Push nach GitHub, Datum in „Abnahme Plan B" eintragen.
+
+## Plan-Konsens (Runde 2, 2026-09-06): Einwände P2-1 bis P2-4, alle übernommen
+- P2-1: `captureStartTime` wiederholt die Erfassung nach dem Spawn; ohne verifizierte Startzeit wird nie gekillt (`killing` mit `killBlockedBy: identity_unknown`, Zone reserviert); `procStart` wird nie nachträglich vom aktuellen PID-Inhaber übernommen.
+- P2-2: Allowlist exakt `.tandem/design/<N>/codex`; verbotene Namen werden auf Windows case-insensitiv geprüft (als Segment und im Scan).
+- P2-3: `retried` erst beim tatsächlichen Modellaufruf; Budgetablehnung ⇒ `retry_pending` (nicht terminal, Zone frei, beim nächsten Refresh erneut); Modellfehler des Retries ⇒ `failed` mit `noteFailure`-Quota-Policy.
+- P2-4: Smoke fordert die Sandbox-Probe als erlaubten Pflichtteil an (Vertrag erlaubt sie ausdrücklich), prüft den Probe-Befehl mit Exitcode ≠ 0 in `tests`, die Fehlermeldung in `notes`, exakte Bytes und exakte Zonen-Dateiliste.
 
 ## Plan-Konsens (Runde 1, 2026-09-06): Einwände P1-1 bis P1-8, alle übernommen
 - P1-1: Kill wird verifiziert (Identität vor dem Kill, bis 5 s warten); nicht bestätigter Kill ⇒ `killing`, aktiv, gemeldet.

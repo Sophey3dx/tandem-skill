@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildResumeArgs, classifyFailure, killTree, parseJsonl, resolveCodex, runCodex, threadIdFromEvents } from "./codex.mjs";
-import { ensureScopeGone, scopeState } from "./confinement.mjs";
+import { RUNNER_SYSTEMCTL_TIMEOUT_MS, quickScopeGone, scopeState } from "./confinement.mjs";
 import { noteFailure } from "./exchange.mjs";
 import { processState, sameProcess, sleepSync } from "./procs.mjs";
 import { ensureBudget } from "./ratelimits.mjs";
@@ -171,11 +171,12 @@ function scopeUnitOf(worker) {
 }
 
 // A worker is alive while its launcher lives OR its scope is not confirmed gone (active, or systemctl not
-// answering): a zone is only released once nothing in the worker's tree can write into it any more.
+// answering): a zone is only released once nothing in the worker's tree can write into it any more. One
+// short systemctl look per refresh: the runner holds the state lock while it checks.
 function workerAlive(worker, env) {
   if (sameProcess(worker)) return true;
   const unit = scopeUnitOf(worker);
-  return unit !== null && scopeState(unit, env) !== "gone";
+  return unit !== null && scopeState(unit, env, { timeoutMs: RUNNER_SYSTEMCTL_TIMEOUT_MS }) !== "gone";
 }
 
 // Kills only a process that is verifiably ours (pid AND start time), then waits up to KILL_CONFIRM_MS for it
@@ -199,8 +200,10 @@ export function killWorker(worker, env = process.env) {
       sleepSync(250);
     }
   }
+  // One short kill-and-look for the scope; waiting for a slow or silent manager is the sentinel's job and
+  // that of the next refresh, never the lock holder's.
   const unit = scopeUnitOf(worker);
-  if (unit && !ensureScopeGone(unit, { env, attempts: 8, waitMs: 250 })) return { gone: false, killed, reason: "scope_unconfirmed" };
+  if (unit && !quickScopeGone(unit, env)) return { gone: false, killed, reason: "scope_unconfirmed" };
   return { gone: true, killed };
 }
 

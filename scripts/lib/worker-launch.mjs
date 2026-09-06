@@ -2,7 +2,8 @@
 // Detached worker launcher. The runner never waits for a worker (each runner call is short-lived), so the
 // exit code of codex would be lost. This wrapper runs codex with INHERITED stdio (stdin = the brief file,
 // stdout/stderr = the log file, both opened by the runner) and appends exactly one JSON line
-// {"type":"tandem.exit","code":…,"signal":…} to the log when codex has exited. No shell is involved.
+// {"type":"tandem.exit","code":…,"signal":…} to the log when codex has exited AND its process tree is
+// confirmed gone. No shell is involved.
 //
 // Guarantees for the zone:
 // - Before anything write-capable exists it creates launched.json (its own pid) next to the log, EXCLUSIVELY
@@ -11,18 +12,22 @@
 //   runner already gave the record up and left an "abandoned" marker under the same name, so a late launcher
 //   must not start codex into a zone that is free again.
 // - Descendants do not outlive the worker. TANDEM_CONFINEMENT (set by the runner from lib/confinement.mjs):
-//   "job" runs codex inside a Windows Job Object with kill-on-close (win-job-run.ps1), "systemd-scope" runs
-//   it inside a transient systemd user scope that is killed as a whole when codex ends, "none" means the
-//   runner allowed an unconfined start explicitly (TANDEM_ALLOW_UNCONFINED_WORKERS=1). On POSIX the launcher
-//   additionally kills every process whose parent chain still leads to it and then its own process group
-//   (the runner spawns it as a group leader and sets TANDEM_LAUNCH_GROUP=1).
+//   "job" runs codex inside a Windows Job Object with kill-on-close (win-job-run.ps1); "systemd-scope" runs
+//   it inside a transient systemd user scope which is killed when codex ends and must be CONFIRMED gone —
+//   until then this launcher stays alive as a sentinel (the runner keeps the worker active and the zone
+//   reserved while the launcher lives); "none" means the runner allowed an unconfined start explicitly
+//   (TANDEM_ALLOW_UNCONFINED_WORKERS=1). On POSIX the launcher additionally kills every process whose parent
+//   chain still leads to it and then its own process group (the runner spawns it as a group leader and sets
+//   TANDEM_LAUNCH_GROUP=1).
 // Usage: node worker-launch.mjs <absolute logFile> <cmd> [args...]
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { ensureScopeGone, systemdRunCommand } from "./confinement.mjs";
 
 const JOB_SCRIPT = fileURLToPath(new URL("./win-job-run.ps1", import.meta.url));
+const SENTINEL_RETRY_MS = 5000;
 const [logFile, cmd, ...args] = process.argv.slice(2);
 if (!logFile || !cmd) {
   process.stderr.write("usage: worker-launch.mjs <logFile> <cmd> [args...]\n");
@@ -41,23 +46,36 @@ function record(entry) {
   }
 }
 
-// Fail-closed and exclusive: the first write creates the marker ("wx"); later writes update our own file.
-function mark(extra = {}, { exclusive = false } = {}) {
-  fs.writeFileSync(markerFile, `${JSON.stringify({ pid: process.pid, at: new Date().toISOString(), confinement, ...extra })}\n`, { encoding: "utf8", flag: exclusive ? "wx" : "w" });
+function note(text) {
+  try {
+    fs.appendFileSync(logFile, `\n${JSON.stringify({ type: "tandem.note", at: new Date().toISOString(), text })}\n`);
+  } catch {
+    // nothing to do
+  }
 }
 
-// POSIX: kill the systemd scope (if any), then every process whose parent chain still leads to us, then the
-// whole process group (which also covers children reparented to init while their parent lived in our
-// group). Windows: the Job Object did it.
-function reapDescendants() {
-  if (process.platform === "win32") return;
-  if (scopeUnit) {
-    try {
-      spawnSync("systemctl", ["--user", "kill", "--signal=SIGKILL", `${scopeUnit}.scope`], { stdio: "ignore", timeout: 10000 });
-    } catch {
-      // the scope is already gone
+// Fail-closed and exclusive: the first write creates the marker ("wx"); later writes update our own file.
+function mark(extra = {}, { exclusive = false } = {}) {
+  fs.writeFileSync(markerFile, `${JSON.stringify({ pid: process.pid, at: new Date().toISOString(), confinement, scopeUnit, ...extra })}\n`, { encoding: "utf8", flag: exclusive ? "wx" : "w" });
+}
+
+// systemd scope: kill and CONFIRM. Never returns before the scope is gone: while it cannot be confirmed
+// (kill refused, manager not answering) this launcher lives on as a sentinel and keeps trying.
+function confirmScopeGone() {
+  if (!scopeUnit) return;
+  let announced = false;
+  while (!ensureScopeGone(scopeUnit, { attempts: 6, waitMs: 500 })) {
+    if (!announced) {
+      note(`scope ${scopeUnit}.scope could not be confirmed gone; staying alive as a sentinel until it is`);
+      announced = true;
     }
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, SENTINEL_RETRY_MS);
   }
+}
+
+// POSIX: every process whose parent chain still leads to us. Windows: the Job Object did it.
+function reapTree() {
+  if (process.platform === "win32") return;
   try {
     const listing = spawnSync("ps", ["-eo", "pid=,ppid="], { encoding: "utf8" }).stdout ?? "";
     const childrenOf = new Map();
@@ -84,20 +102,26 @@ function reapDescendants() {
       }
     }
   } catch {
-    // ps unavailable: the group kill below is all we can do
+    // ps unavailable: the scope and the group kill are what remains
   }
-  if (process.env.TANDEM_LAUNCH_GROUP === "1") {
-    try {
-      process.kill(-process.pid, "SIGKILL"); // includes ourselves: the exit record is already written
-    } catch {
-      // group already empty
-    }
+}
+
+// The whole process group, which also covers children reparented to init while their parent lived in our
+// group. Includes ourselves: called last, after the exit record is written.
+function killGroup() {
+  if (process.platform === "win32" || process.env.TANDEM_LAUNCH_GROUP !== "1") return;
+  try {
+    process.kill(-process.pid, "SIGKILL");
+  } catch {
+    // group already empty
   }
 }
 
 function leave(entry, code) {
+  confirmScopeGone(); // may block for as long as it takes; the runner keeps the zone reserved meanwhile
+  reapTree();
   record(entry);
-  reapDescendants();
+  killGroup();
   process.exit(code);
 }
 
@@ -134,8 +158,9 @@ if (confinement === "job") {
   spawnArgs = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", JOB_SCRIPT, cmdFile];
 } else if (confinement === "systemd-scope") {
   // systemd-run passes everything after "--" verbatim; the scope is a cgroup no descendant can leave.
-  spawnCmd = "systemd-run";
-  spawnArgs = ["--user", "--scope", "--quiet", "--collect", `--unit=${scopeUnit}`, "--", cmd, ...args];
+  const sdr = systemdRunCommand(process.env);
+  spawnCmd = sdr.cmd;
+  spawnArgs = [...sdr.prefix, "--user", "--scope", "--quiet", "--collect", `--unit=${scopeUnit}`, "--", cmd, ...args];
 }
 let child;
 try {
@@ -144,7 +169,7 @@ try {
   leave({ code: 127, signal: null, error: error.message }, 127);
 }
 try {
-  mark({ childPid: child.pid ?? null, job: confinement === "job", scopeUnit });
+  mark({ childPid: child.pid ?? null, job: confinement === "job" });
 } catch {
   // the exclusive marker is in place; the child pid is a convenience
 }

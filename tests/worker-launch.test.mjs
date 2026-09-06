@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { parseJsonl } from "../scripts/lib/codex.mjs";
 import { pidAlive } from "../scripts/lib/state.mjs";
 import { sleepSync } from "../scripts/lib/procs.mjs";
-import { makeProject } from "./helpers.mjs";
+import { FAKE_SYSTEMCTL, FAKE_SYSTEMD_RUN, makeProject } from "./helpers.mjs";
 
 const LAUNCHER = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "scripts", "lib", "worker-launch.mjs");
 
@@ -125,4 +125,42 @@ test("the launcher refuses to run without a log file and a command", () => {
   const result = spawnSync(process.execPath, [LAUNCHER], { encoding: "utf8" });
   assert.equal(result.status, 64);
   assert.match(result.stderr, /usage/);
+});
+
+test("systemd scope: the exit is reported only once the scope is confirmed gone; until then the launcher lives as a sentinel", async () => {
+  const dir = makeProject("launch-scope");
+  const logFile = path.join(dir, "log.txt");
+  const stateFile = path.join(dir, "scope-state.txt");
+  fs.writeFileSync(stateFile, "active\n", "utf8");
+  const sdrLog = path.join(dir, "systemd-run.log");
+  const env = {
+    ...process.env, TANDEM_CONFINEMENT: "systemd-scope", TANDEM_TEST_SYSTEMCTL: FAKE_SYSTEMCTL, TANDEM_TEST_SYSTEMD_RUN: FAKE_SYSTEMD_RUN,
+    FAKE_SYSTEMCTL_KILL: "fail", FAKE_SYSTEMCTL_STATE_FILE: stateFile, FAKE_SYSTEMD_RUN_LOG: sdrLog
+  };
+  const stdinFile = path.join(dir, "stdin.txt");
+  fs.writeFileSync(stdinFile, "", "utf8");
+  const inFd = fs.openSync(stdinFile, "r");
+  const outFd = fs.openSync(logFile, "a");
+  const child = spawn(process.execPath, [LAUNCHER, logFile, process.execPath, "-e", "process.exit(0)"], { stdio: [inFd, outFd, outFd], windowsHide: true, env });
+  fs.closeSync(inFd);
+  fs.closeSync(outFd);
+  let exited = false;
+  child.on("exit", () => {
+    exited = true;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 5000));
+  assert.equal(exited, false, "the launcher stays alive while the scope cannot be confirmed gone");
+  assert.equal(exitRecord(logFile), undefined, "no exit record before the confirmation");
+  assert.match(fs.readFileSync(logFile, "utf8"), /staying alive as a sentinel/);
+  const marker = JSON.parse(fs.readFileSync(path.join(dir, "launched.json"), "utf8"));
+  assert.equal(marker.scopeUnit, `tandem-worker-${child.pid}`);
+  const started = parseJsonl(fs.readFileSync(sdrLog, "utf8")).find((e) => Array.isArray(e.argv) && e.argv.includes("--"));
+  assert.ok(started.argv.includes(`--unit=tandem-worker-${child.pid}`), "codex was started inside the named scope");
+  assert.equal(started.argv[started.argv.indexOf("--") + 1], process.execPath);
+  fs.writeFileSync(stateFile, "inactive\n", "utf8"); // the scope is empty now
+  await Promise.race([
+    new Promise((resolve) => child.on("exit", resolve)),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("launcher did not exit after the scope was confirmed gone")), 20000))
+  ]);
+  assert.equal(exitRecord(logFile).code, 0);
 });

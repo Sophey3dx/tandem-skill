@@ -7,6 +7,8 @@ export const TESTS_DIR = path.dirname(fileURLToPath(import.meta.url));
 export const SKILL_ROOT = path.resolve(TESTS_DIR, "..");
 export const RUNNER = path.join(SKILL_ROOT, "scripts", "tandem.mjs");
 export const FAKE = path.join(TESTS_DIR, "fake-codex.mjs");
+export const FAKE_SYSTEMCTL = path.join(TESTS_DIR, "fake-systemctl.mjs");
+export const FAKE_SYSTEMD_RUN = path.join(TESTS_DIR, "fake-systemd-run.mjs");
 export const TMP_ROOT = path.join(TESTS_DIR, ".tmp");
 
 export function makeProject(name = "proj") {

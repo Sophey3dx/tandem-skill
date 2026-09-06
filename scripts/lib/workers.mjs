@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildResumeArgs, classifyFailure, killTree, parseJsonl, resolveCodex, runCodex, threadIdFromEvents } from "./codex.mjs";
+import { ensureScopeGone, scopeState } from "./confinement.mjs";
 import { noteFailure } from "./exchange.mjs";
 import { processState, sameProcess, sleepSync } from "./procs.mjs";
 import { ensureBudget } from "./ratelimits.mjs";
@@ -160,24 +161,47 @@ function finish(state, worker, status, now, extra = {}) {
   bookWorkerUsage(state, worker);
 }
 
+// The systemd scope a worker runs in (Linux confinement), or null. Taken from the launcher's marker, else
+// derived from the launcher pid the way the launcher names it.
+function scopeUnitOf(worker) {
+  if (worker.confinement !== "systemd-scope") return null;
+  const marker = launchMarker(worker);
+  if (marker?.scopeUnit) return marker.scopeUnit;
+  return worker.pid ? `tandem-worker-${worker.pid}` : null;
+}
+
+// A worker is alive while its launcher lives OR its scope is not confirmed gone (active, or systemctl not
+// answering): a zone is only released once nothing in the worker's tree can write into it any more.
+function workerAlive(worker, env) {
+  if (sameProcess(worker)) return true;
+  const unit = scopeUnitOf(worker);
+  return unit !== null && scopeState(unit, env) !== "gone";
+}
+
 // Kills only a process that is verifiably ours (pid AND start time), then waits up to KILL_CONFIRM_MS for it
-// to disappear. Without a verified identity nothing is ever killed: an unknown identity (never captured), an
-// unverifiable one (the start-time query fails right now) and a record without a pid all leave the worker
-// active as `killing`; every refresh tries again.
+// to disappear, then kills and CONFIRMS the worker's scope where there is one. Without a verified identity
+// nothing is ever killed: an unknown identity (never captured), an unverifiable one (the start-time query
+// fails right now) and a record without a pid all leave the worker active as `killing`; every refresh tries
+// again. An unconfirmed scope does the same (`scope_unconfirmed`).
 export function killWorker(worker, env = process.env) {
   if (worker.pid === null || worker.pid === undefined) return { gone: false, killed: false, reason: "starting" };
   const state = processState(worker);
-  if (state === "gone" || state === "foreign") return { gone: true, killed: false };
   if (state === "unverified") {
     return { gone: false, killed: false, reason: worker.procStart === null || worker.procStart === undefined ? "identity_unknown" : "identity_unverified" };
   }
-  killTree(worker.pid, env);
-  const until = Date.now() + KILL_CONFIRM_MS;
-  while (Date.now() < until) {
-    if (!sameProcess(worker)) return { gone: true, killed: true };
-    sleepSync(250);
+  let killed = false;
+  if (state === "alive") {
+    killTree(worker.pid, env);
+    killed = true;
+    const until = Date.now() + KILL_CONFIRM_MS;
+    while (sameProcess(worker)) {
+      if (Date.now() >= until) return { gone: false, killed: false };
+      sleepSync(250);
+    }
   }
-  return { gone: false, killed: false };
+  const unit = scopeUnitOf(worker);
+  if (unit && !ensureScopeGone(unit, { env, attempts: 8, waitMs: 250 })) return { gone: false, killed, reason: "scope_unconfirmed" };
+  return { gone: true, killed };
 }
 
 // Exactly one schema retry for an invalid result: resume the worker's own thread read-only and ask for the
@@ -323,7 +347,7 @@ export async function refreshWorkers(state, { project, layout, now = Date.now(),
     }
     // procStart is never taken over from the current pid owner later; an unknown identity stays unknown.
     if (worker.procStart === null || worker.procStart === undefined) worker.identityUnknown = true;
-    const alive = sameProcess(worker);
+    const alive = workerAlive(worker, env);
     const hasResult = fs.existsSync(worker.resultPath);
     if (worker.status === "killing") {
       if (alive) {

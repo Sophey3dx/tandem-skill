@@ -5,7 +5,7 @@ import path from "node:path";
 import { killTree, parseJsonl } from "../scripts/lib/codex.mjs";
 import { sleepSync } from "../scripts/lib/procs.mjs";
 import { spawnSync } from "node:child_process";
-import { SKILL_ROOT, makeProject, readLog, runTandem, startProject, writeFile } from "./helpers.mjs";
+import { FAKE_SYSTEMCTL, FAKE_SYSTEMD_RUN, SKILL_ROOT, makeProject, readLog, runTandem, startProject, writeFile } from "./helpers.mjs";
 
 const BRIEF = [
   "# Auftrag W",
@@ -583,4 +583,34 @@ test("an unclear marker keeps a given-up record reserved until it can be read; a
   const lost = runTandem(["worker", "status", "W2"], { cwd: dir });
   assert.equal(lost.json.workers[0].status, "failed", JSON.stringify(lost.json));
   assert.equal(lost.json.workers[0].failure, "spawn_lost");
+});
+
+test("systemd scope: a worker stays alive until its scope is confirmed gone, even after its launcher died; cancel waits for the scope too", () => {
+  const { dir, zone, brief } = prepared("worker-scope");
+  const stateFile = path.join(dir, "scope-state.txt");
+  fs.writeFileSync(stateFile, "active\n", "utf8");
+  const env = { TANDEM_TEST_CONFINEMENT: "systemd-scope", TANDEM_TEST_SYSTEMCTL: FAKE_SYSTEMCTL, TANDEM_TEST_SYSTEMD_RUN: FAKE_SYSTEMD_RUN, FAKE_SYSTEMCTL_KILL: "fail", FAKE_SYSTEMCTL_STATE_FILE: stateFile };
+  const a = runTandem(["worker", "start", "--zone", zone, "--brief-file", brief], { cwd: dir, env });
+  assert.equal(a.json.ok, true, JSON.stringify(a.json));
+  assert.equal(a.json.worker.confinement, "systemd-scope");
+  sleepSync(3000); // the fake codex has finished; the launcher is a sentinel because the scope reads "active"
+  const mid = runTandem(["worker", "status", "W1"], { cwd: dir, env });
+  assert.equal(mid.json.workers[0].status, "finishing", JSON.stringify(mid.json.workers[0]));
+  assert.equal(mid.json.active, 1, "zone reserved while the tree is not confirmed gone");
+  // Launcher killed from outside: the scope alone keeps the worker alive.
+  killTree(a.json.worker.pid);
+  sleepSync(500);
+  const still = runTandem(["worker", "status", "W1"], { cwd: dir, env });
+  assert.equal(still.json.workers[0].status, "finishing", "launcher dead, scope active: still alive");
+  assert.equal(still.json.active, 1);
+  // cancel cannot confirm the scope either: non-terminal, zone reserved, retried on every refresh.
+  const cancelled = runTandem(["worker", "cancel", "W1"], { cwd: dir, env });
+  assert.equal(cancelled.json.gone, false);
+  assert.equal(cancelled.json.worker.status, "killing");
+  assert.equal(cancelled.json.worker.killBlockedBy, "scope_unconfirmed");
+  assert.equal(runTandem(["worker", "start", "--zone", zone, "--brief-file", brief], { cwd: dir, env }).json.error, "bad_zone", "zone still reserved");
+  fs.writeFileSync(stateFile, "inactive\n", "utf8"); // the scope is empty now
+  const done = runTandem(["worker", "status", "W1"], { cwd: dir, env });
+  assert.equal(done.json.workers[0].status, "done", JSON.stringify(done.json.workers[0]));
+  assert.equal(done.json.active, 0);
 });

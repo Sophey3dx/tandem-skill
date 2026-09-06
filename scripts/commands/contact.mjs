@@ -40,7 +40,7 @@ export async function runContact({ project, options }) {
     const outFile = path.join(layout.replies, `${base}.json`);
     if (kind === "resume") state.usage.session = emptyUsage(); // new session starts WITH this contact
     const { result, parsed, errors, attempts } = await runWithSchema({
-      state, project, layout, base, n, contactId, promptFile: wrapped, schema: spec.schema, effort, deadlineMs, outFile, kind, options
+      state, project, layout, base, n, contactId, promptFile: wrapped, schema: spec.schema, effort, deadlineMs, outFile, kind, idPrefix: contactId, options
     });
     state.contacts = n;
     state.lastContact = { id: contactId, kind, at: new Date().toISOString(), status: parsed ? "ok" : "invalid_output", replyPath: outFile, durationMs: result.durationMs, effort };

@@ -42,6 +42,10 @@ export function resolveCodex(env = process.env) {
   );
 }
 
+// Codex children are spawned detached on POSIX so they lead their own process group; killing the group
+// (-pid) takes their subprocesses with them. On Windows taskkill /T walks the tree.
+export const SPAWN_OPTIONS = { windowsHide: true, detached: process.platform !== "win32" };
+
 // Returns true when the kill command reported success. TANDEM_TEST_NO_KILL=1 skips the kill (tests only).
 export function killTree(pid, env = process.env) {
   if (!pid || env.TANDEM_TEST_NO_KILL === "1") return false;
@@ -49,12 +53,16 @@ export function killTree(pid, env = process.env) {
     const result = spawnSync("taskkill", ["/pid", String(pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
     return result.status === 0;
   }
-  try {
-    process.kill(pid, "SIGKILL");
-    return true;
-  } catch {
-    return false;
+  let killed = false;
+  for (const target of [-pid, pid]) {
+    try {
+      process.kill(target, "SIGKILL");
+      killed = true;
+    } catch {
+      // group or process already gone
+    }
   }
+  return killed;
 }
 
 export function parseJsonl(text) {
@@ -102,7 +110,7 @@ export function runCodex({ args, promptFile = null, cwd, timeoutMs, env = proces
   const fullArgs = [...prefix, ...args];
   const started = Date.now();
   return new Promise((resolve) => {
-    const child = spawn(cmd, fullArgs, { cwd, env, stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+    const child = spawn(cmd, fullArgs, { cwd, env, stdio: ["pipe", "pipe", "pipe"], ...SPAWN_OPTIONS });
     let stdout = "";
     let stderr = "";
     let timedOut = false;
@@ -127,6 +135,17 @@ export function runCodex({ args, promptFile = null, cwd, timeoutMs, env = proces
       if (graceTimer) clearTimeout(graceTimer);
       child.stdout.removeAllListeners("data");
       child.stderr.removeAllListeners("data");
+      if (status === null && child.exitCode === null) {
+        // Still running after a failed kill: drop our handles so the CLI can exit instead of hanging.
+        for (const stream of [child.stdin, child.stdout, child.stderr]) {
+          try {
+            stream.destroy();
+          } catch {
+            // ignore
+          }
+        }
+        child.unref();
+      }
       if (logFile) {
         try {
           fs.writeFileSync(logFile, `# command\n${JSON.stringify([cmd, ...fullArgs])}\n# stdout\n${stdout}\n# stderr\n${stderr}\n`, "utf8");

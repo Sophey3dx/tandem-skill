@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { killTree, resolveCodex } from "./codex.mjs";
+import { SPAWN_OPTIONS, killTree, resolveCodex } from "./codex.mjs";
 import { TandemError } from "./output.mjs";
 import { DEFAULT_MIN_REMAINING } from "./state.mjs";
 
@@ -28,7 +28,7 @@ export function normalizeRateLimits(result) {
 export function readRateLimits({ env = process.env, timeoutMs = 15000 } = {}) {
   const { cmd, prefix } = resolveCodex(env);
   return new Promise((resolve) => {
-    const child = spawn(cmd, [...prefix, "app-server"], { env, stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+    const child = spawn(cmd, [...prefix, "app-server"], { env, stdio: ["pipe", "pipe", "pipe"], ...SPAWN_OPTIONS });
     let buffer = "";
     let done = false;
     const finish = (value) => {
@@ -40,7 +40,17 @@ export function readRateLimits({ env = process.env, timeoutMs = 15000 } = {}) {
       } catch {
         // ignore
       }
-      if (child.exitCode === null) killTree(child.pid, env); // synchronous; the pid is still ours here
+      if (child.exitCode === null) {
+        killTree(child.pid, env); // synchronous; the pid is still ours here
+        for (const stream of [child.stdin, child.stdout, child.stderr]) {
+          try {
+            stream.destroy();
+          } catch {
+            // ignore
+          }
+        }
+        child.unref();
+      }
       resolve(value);
     };
     const timer = setTimeout(() => finish({ error: "timeout" }), timeoutMs);

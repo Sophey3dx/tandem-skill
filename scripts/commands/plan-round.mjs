@@ -19,10 +19,26 @@ export function isConsensus(verdict) {
   );
 }
 
-// Copies a plan/matrix file into .tandem/plans unless it already IS that file (self-copy fails on Windows).
-function archiveInto(sourceFile, targetFile) {
-  if (canonical(sourceFile) === canonical(targetFile)) return;
-  fs.copyFileSync(sourceFile, targetFile);
+// Archives are written as <name>.pending.md first and only renamed into place after a valid verdict, so a
+// failed re-run never overwrites the last archived (possibly approved) version. A source that already IS the
+// archive file is left alone (self-copy fails on Windows).
+function stageArchive(sourceFile, targetFile) {
+  if (canonical(sourceFile) === canonical(targetFile)) return null;
+  const pending = targetFile.replace(/\.md$/, ".pending.md");
+  fs.copyFileSync(sourceFile, pending);
+  return pending;
+}
+
+function commitArchives(staged) {
+  for (const { pending, target } of staged) {
+    if (pending) fs.renameSync(pending, target);
+  }
+}
+
+function discardArchives(staged) {
+  for (const { pending } of staged) {
+    if (pending && fs.existsSync(pending)) fs.unlinkSync(pending);
+  }
 }
 
 export async function runPlanRound({ project, options }) {
@@ -48,10 +64,13 @@ export async function runPlanRound({ project, options }) {
     const layout = ensureLayout(project);
     const plan = fs.readFileSync(planFile, "utf8");
     const hash = crypto.createHash("sha256").update(plan).digest("hex").slice(0, 12);
-    archiveInto(planFile, path.join(layout.plans, `plan-r${round}.md`));
+    const staged = [];
+    const planTarget = path.join(layout.plans, `plan-r${round}.md`);
+    staged.push({ pending: stageArchive(planFile, planTarget), target: planTarget });
     let matrixBlock = "";
     if (matrixFile) {
-      archiveInto(matrixFile, path.join(layout.plans, `matrix-r${round}.md`));
+      const matrixTarget = path.join(layout.plans, `matrix-r${round}.md`);
+      staged.push({ pending: stageArchive(matrixFile, matrixTarget), target: matrixTarget });
       matrixBlock = renderTemplate("plan-matrix", { PREVIOUS: String(round - 1), MATRIX: fs.readFileSync(matrixFile, "utf8") });
     }
     const n = state.contacts + 1;
@@ -60,17 +79,27 @@ export async function runPlanRound({ project, options }) {
     const wrapped = path.join(layout.prompts, `${base}.md`);
     fs.writeFileSync(wrapped, renderTemplate("plan-round", { ROUND: String(round), PLAN_HASH: hash, PLAN: plan, MATRIX_BLOCK: matrixBlock }), "utf8");
     const outFile = path.join(layout.replies, `${base}.json`);
-    const { result, parsed, errors, attempts } = await runWithSchema({
-      state, project, layout, base, n, contactId, promptFile: wrapped, schema: "plan-verdict", effort, deadlineMs, outFile, kind: "plan", options
-    });
+    let exchange;
+    try {
+      exchange = await runWithSchema({
+        state, project, layout, base, n, contactId, promptFile: wrapped, schema: "plan-verdict", effort, deadlineMs, outFile, kind: "plan", idPrefix: `P${round}`, options
+      });
+    } catch (error) {
+      discardArchives(staged);
+      throw error;
+    }
+    const { result, parsed, errors, attempts } = exchange;
     state.contacts = n;
     state.lastContact = { id: contactId, kind: `plan-r${round}`, at: new Date().toISOString(), status: parsed ? "ok" : "invalid_output", replyPath: outFile, durationMs: result.durationMs, effort };
     if (parsed) {
+      commitArchives(staged);
       nextPlan.hash = hash;
       nextPlan.round = round;
       nextPlan.planFile = planFile;
       nextPlan.verdicts.push({ round, hash, verdict: parsed.verdict, consensus: isConsensus(parsed), blockersOpen: parsed.criteria.blockersOpen, points: parsed.points.length, replyPath: outFile });
       state.plan = nextPlan;
+    } else {
+      discardArchives(staged);
     }
     saveState(project, state);
     if (!parsed) {

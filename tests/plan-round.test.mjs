@@ -60,15 +60,28 @@ test("a plan written directly to .tandem/plans/plan-r1.md is accepted (no self-c
   assert.equal(fs.readFileSync(inPlace, "utf8"), "# Plan in place");
 });
 
-test("APPROVE without a named residual risk is not consensus; a failed round keeps the previous plan state", () => {
-  const { dir, plan } = prepared("plan-risk");
-  const noRisk = runTandem(["plan-round", "--round", "1", "--plan-file", plan], { cwd: dir, env: { FAKE_PLAN_RISK: "  " } });
-  assert.equal(noRisk.json.verdict.verdict, "APPROVE");
-  assert.equal(noRisk.json.consensus, false);
+test("APPROVE without a named residual risk is rejected as invalid output (after one retry)", () => {
+  const { dir, plan, logFile } = prepared("plan-risk");
+  const noRisk = runTandem(["plan-round", "--round", "1", "--plan-file", plan], { cwd: dir, env: { FAKE_PLAN_RISK: "  ", FAKE_CODEX_LOG: logFile } });
+  assert.equal(noRisk.json.error, "invalid_output");
+  assert.match(noRisk.json.message, /residualRisk/);
+  assert.equal(readLog(logFile).filter((c) => c.argv[1] === "resume").length, 2);
+  const state = JSON.parse(fs.readFileSync(path.join(dir, ".tandem", "state.json"), "utf8"));
+  assert.equal(state.plan.round, 0, "invalid round must not advance the plan state");
+  assert.equal(fs.existsSync(path.join(dir, ".tandem", "plans", "plan-r1.md")), false, "no archive without a valid verdict");
+});
+
+test("a failed re-run keeps the previous plan state and the archived approved plan", () => {
+  const { dir, plan } = prepared("plan-archive");
+  assert.equal(runTandem(["plan-round", "--round", "1", "--plan-file", plan], { cwd: dir }).json.consensus, true);
   const before = JSON.parse(fs.readFileSync(path.join(dir, ".tandem", "state.json"), "utf8")).plan;
-  assert.equal(before.round, 1);
-  const failed = runTandem(["plan-round", "--round", "1", "--plan-file", plan], { cwd: dir, env: { FAKE_CODEX_MODE: "fail" } });
+  const archive = path.join(dir, ".tandem", "plans", "plan-r1.md");
+  assert.equal(fs.readFileSync(archive, "utf8"), "# Plan\n\n## Task 1\nDo X.");
+  const newPlan = writeFile(dir, "plan2.md", "# Plan v2\n\n## Task 1\nDo Y.");
+  const failed = runTandem(["plan-round", "--round", "1", "--plan-file", newPlan], { cwd: dir, env: { FAKE_CODEX_MODE: "fail" } });
   assert.equal(failed.json.error, "codex_failed");
   const after = JSON.parse(fs.readFileSync(path.join(dir, ".tandem", "state.json"), "utf8")).plan;
   assert.deepEqual(after, before);
+  assert.equal(fs.readFileSync(archive, "utf8"), "# Plan\n\n## Task 1\nDo X.", "approved archive must survive a failed re-run");
+  assert.equal(fs.existsSync(path.join(dir, ".tandem", "plans", "plan-r1.pending.md")), false, "pending copy is discarded");
 });

@@ -30,7 +30,14 @@ function fail(text, code = 1) {
   process.exit(code);
 }
 
-function sampleFor(schema) {
+// Point ids must follow the contract's prefix (C<n>, P<round>, R). The prompt states it; parse it from stdin.
+function idPrefixFrom(stdin) {
+  const match = /(?:Format|IDs|`id`) ([A-Z]+\d*)-1/.exec(stdin);
+  return match ? match[1] : "C1";
+}
+
+function sampleFor(schema, stdin) {
+  const prefix = idPrefixFrom(stdin);
   const verdictEnum = schema.properties?.verdict?.enum ?? [];
   if (verdictEnum.includes("APPROVE")) {
     const verdict = process.env.FAKE_PLAN_VERDICT ?? "APPROVE";
@@ -38,7 +45,7 @@ function sampleFor(schema) {
       verdict,
       checked: ["plan.md"],
       criteria: { blockersOpen: verdict === "APPROVE" ? 0 : 1, sourcesRead: true, testStrategyFeasible: true, residualRisk: process.env.FAKE_PLAN_RISK ?? "gering" },
-      points: verdict === "APPROVE" ? [] : [{ id: "P1-1", severity: "MAJOR", category: "correctness", text: "fake objection", section: "Task 1", newEvidence: null }]
+      points: verdict === "APPROVE" ? [] : [{ id: `${prefix}-1`, severity: "MAJOR", category: "correctness", text: "fake objection", section: "Task 1", newEvidence: null }]
     };
   }
   if (verdictEnum.includes("OK")) {
@@ -46,7 +53,7 @@ function sampleFor(schema) {
     return {
       verdict,
       checked: ["src/a.js"],
-      points: verdict === "OK" ? [] : [{ id: "C1-1", severity: "MAJOR", text: "fake concern", file: "src/a.js", line: 3 }],
+      points: verdict === "OK" ? [] : [{ id: `${prefix}-1`, severity: verdict === "BLOCK" ? "BLOCKER" : "MAJOR", text: "fake concern", file: "src/a.js", line: 3 }],
       residualRisk: "gering"
     };
   }
@@ -54,8 +61,19 @@ function sampleFor(schema) {
   return { position: "fake", reasons: [], checked: [], risks: [], recommendation: "fake" };
 }
 
+// FAKE_USED_PRIMARY_SEQUENCE="18,97" lets consecutive rate-limit queries (counted via FAKE_CODEX_LOG) return
+// different values, e.g. to refuse the budget only before a retry.
+function primaryUsed() {
+  const sequence = process.env.FAKE_USED_PRIMARY_SEQUENCE?.split(",").map((v) => Number(v.trim()));
+  if (sequence?.length && process.env.FAKE_CODEX_LOG && fs.existsSync(process.env.FAKE_CODEX_LOG)) {
+    const calls = fs.readFileSync(process.env.FAKE_CODEX_LOG, "utf8").split(/\r?\n/).filter((l) => l.includes('"argv":["app-server"')).length;
+    return sequence[Math.min(Math.max(calls - 1, 0), sequence.length - 1)];
+  }
+  return Number(process.env.FAKE_USED_PRIMARY ?? 18);
+}
+
 function appServer() {
-  const used = { primary: Number(process.env.FAKE_USED_PRIMARY ?? 18), secondary: Number(process.env.FAKE_USED_SECONDARY ?? 6) };
+  const used = { primary: primaryUsed(), secondary: Number(process.env.FAKE_USED_SECONDARY ?? 6) };
   // FAKE_RATELIMIT_MODE: ok (default) | error (JSON-RPC error) | silent (never answers) | crash (exit before answering)
   const limitMode = process.env.FAKE_RATELIMIT_MODE ?? "ok";
   if (limitMode === "crash") process.exit(3);
@@ -128,7 +146,7 @@ function exec() {
   let text;
   if (schemaFile) {
     const schema = JSON.parse(fs.readFileSync(schemaFile, "utf8"));
-    text = JSON.stringify(mode === "invalid_json" ? { verdict: "MAYBE" } : sampleFor(schema));
+    text = JSON.stringify(mode === "invalid_json" ? { verdict: "MAYBE" } : sampleFor(schema, stdin));
   } else {
     text = process.env.FAKE_CODEX_REPLY ?? "FAKE OK";
   }

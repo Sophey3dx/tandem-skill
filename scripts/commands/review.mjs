@@ -2,11 +2,10 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { buildResumeArgs, failureToError, minutes, normalizeEffort, runCodex, threadIdFromEvents } from "../lib/codex.mjs";
-import { noteFailure, recordFailedContact } from "../lib/exchange.mjs";
+import { checkBudgetOrRecord, noteFailure, recordFailedContact, retryPromptFile } from "../lib/exchange.mjs";
 import { TandemError } from "../lib/output.mjs";
 import { ensureLayout, stamp } from "../lib/paths.mjs";
 import { renderTemplate } from "../lib/prompts.mjs";
-import { ensureBudget, minRemainingOf } from "../lib/ratelimits.mjs";
 import { parseReplyFile, schemaPath } from "../lib/schema.mjs";
 import { addUsage, loadState, saveState, withLock } from "../lib/state.mjs";
 import { extractUsage } from "../lib/usage.mjs";
@@ -63,21 +62,12 @@ export async function runReview({ project, options }) {
     let errors = [];
     while (attempts < 2) {
       attempts += 1;
-      try {
-        await ensureBudget(state, { minRemaining: minRemainingOf(options) }); // before every model call
-      } catch (error) {
-        saveState(project, state);
-        throw error;
-      }
+      await checkBudgetOrRecord(state, { project, options, previous: result, n, contactId, kind: "review", outFile, effort }); // before every model call
       const retry = attempts > 1;
       const args = retry
         ? buildResumeArgs({ threadId: reviewThreadId, effort, schemaPath: schema, outFile })
         : ["exec", "--json", "-C", project, "-s", "read-only", "--skip-git-repo-check", "-c", `model_reasoning_effort=${effort}`, "--output-schema", schema, "-o", outFile, "-"];
-      let currentPrompt = promptFile;
-      if (retry) {
-        currentPrompt = path.join(layout.prompts, `${base}-retry.md`);
-        fs.writeFileSync(currentPrompt, `Deine letzte Antwort war nicht schema-konform (${errors.join("; ")}). Antworte jetzt erneut, ausschließlich als JSON nach dem Schema verdict, ohne Text davor oder danach.\n`, "utf8");
-      }
+      const currentPrompt = retry ? retryPromptFile(layout, base, "verdict", errors) : promptFile;
       result = await runCodex({ args, promptFile: currentPrompt, cwd: project, timeoutMs, logFile: path.join(layout.replies, `${base}${retry ? "-retry" : ""}.log`) });
       addUsage(state, "review", extractUsage(result));
       if (result.failure) {
@@ -87,7 +77,7 @@ export async function runReview({ project, options }) {
         throw failureToError(result, "review");
       }
       reviewThreadId = reviewThreadId ?? threadIdFromEvents(result.events);
-      ({ parsed, errors } = parseReplyFile(outFile, "verdict"));
+      ({ parsed, errors } = parseReplyFile(outFile, "verdict", { idPrefix: "R" }));
       if (parsed || !reviewThreadId) break; // without a thread id there is nothing to resume
     }
     state.contacts = n;

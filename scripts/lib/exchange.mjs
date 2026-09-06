@@ -26,7 +26,29 @@ export function recordFailedContact(state, { n, contactId, kind, outFile, effort
   };
 }
 
-export async function runWithSchema({ state, project, layout, base, n, contactId, promptFile, schema, effort, deadlineMs, outFile, kind, options = {} }) {
+// Budget check before a model call. If a previous attempt already ran (retry path), a refusal still books the
+// contact so its id and files are not reused by the next command.
+export async function checkBudgetOrRecord(state, { project, options, previous, n, contactId, kind, outFile, effort }) {
+  try {
+    await ensureBudget(state, { minRemaining: minRemainingOf(options) });
+  } catch (error) {
+    if (previous) recordFailedContact(state, { n, contactId, kind, outFile, effort, result: { failure: error.code ?? "quota_low", durationMs: previous.durationMs } });
+    saveState(project, state);
+    throw error;
+  }
+}
+
+export function retryPromptFile(layout, base, schema, errors) {
+  const file = path.join(layout.prompts, `${base}-retry.md`);
+  fs.writeFileSync(
+    file,
+    `Deine letzte Antwort war nicht schema-konform (${errors.join("; ")}). Antworte jetzt erneut, ausschließlich als JSON nach dem Schema ${schema}, ohne Text davor oder danach.\n`,
+    "utf8"
+  );
+  return file;
+}
+
+export async function runWithSchema({ state, project, layout, base, n, contactId, promptFile, schema, effort, deadlineMs, outFile, kind, idPrefix, options = {} }) {
   const args = buildResumeArgs({ threadId: state.threadId, effort, schemaPath: schemaPath(schema), outFile });
   let attempts = 0;
   let result = null;
@@ -35,12 +57,7 @@ export async function runWithSchema({ state, project, layout, base, n, contactId
   let currentPrompt = promptFile;
   while (attempts < 2) {
     attempts += 1;
-    try {
-      await ensureBudget(state, { minRemaining: minRemainingOf(options) }); // before EVERY model call, retry included
-    } catch (error) {
-      saveState(project, state);
-      throw error;
-    }
+    await checkBudgetOrRecord(state, { project, options, previous: result, n, contactId, kind, outFile, effort }); // before EVERY model call
     result = await runCodex({
       args,
       promptFile: currentPrompt,
@@ -55,14 +72,9 @@ export async function runWithSchema({ state, project, layout, base, n, contactId
       saveState(project, state);
       throw failureToError(result, kind);
     }
-    ({ parsed, errors } = parseReplyFile(outFile, schema));
+    ({ parsed, errors } = parseReplyFile(outFile, schema, { idPrefix }));
     if (parsed) break;
-    currentPrompt = path.join(layout.prompts, `${base}-retry.md`);
-    fs.writeFileSync(
-      currentPrompt,
-      `Deine letzte Antwort war nicht schema-konform (${errors.join("; ")}). Antworte jetzt erneut, ausschließlich als JSON nach dem Schema ${schema}, ohne Text davor oder danach.\n`,
-      "utf8"
-    );
+    currentPrompt = retryPromptFile(layout, base, schema, errors);
   }
   return { result, parsed, errors, attempts };
 }

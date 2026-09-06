@@ -56,7 +56,41 @@ export function validate(schema, value, at = "$") {
 // Caps are enforced here, not in the schema files: OpenAI strict mode does not reliably accept maxItems.
 export const POINT_CAPS = { verdict: 5, "plan-verdict": 8 };
 
-export function parseReplyFile(file, schemaName) {
+function escapeRegExp(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// Consistency rules the schema alone cannot express: verdict vs. point severities, non-empty residual risk,
+// point ids in the contract's format. A violation counts as an invalid answer and triggers the one retry.
+export function semanticErrors(schemaName, value, { idPrefix } = {}) {
+  const errors = [];
+  const points = Array.isArray(value?.points) ? value.points : [];
+  const severities = new Set(points.map((p) => p?.severity));
+  const worst = severities.has("BLOCKER") ? "BLOCKER" : severities.has("MAJOR") ? "MAJOR" : null;
+  if (idPrefix) {
+    const pattern = new RegExp(`^${escapeRegExp(idPrefix)}-\\d+$`);
+    points.forEach((p, index) => {
+      if (!pattern.test(String(p?.id ?? ""))) errors.push(`$.points[${index}].id: must match ${idPrefix}-<n>`);
+    });
+  }
+  if (schemaName === "verdict") {
+    if (!String(value?.residualRisk ?? "").trim()) errors.push("$.residualRisk: must not be empty");
+    if (worst === "BLOCKER" && value?.verdict !== "BLOCK") errors.push("$.verdict: BLOCKER points require verdict BLOCK");
+    if (worst === "MAJOR" && value?.verdict === "OK") errors.push("$.verdict: MAJOR points contradict verdict OK");
+    if (value?.verdict === "BLOCK" && worst !== "BLOCKER") errors.push("$.verdict: BLOCK requires a BLOCKER point");
+    if (value?.verdict === "CONCERN" && points.length === 0) errors.push("$.points: CONCERN requires at least one point");
+  }
+  if (schemaName === "plan-verdict") {
+    if (!String(value?.criteria?.residualRisk ?? "").trim()) errors.push("$.criteria.residualRisk: must not be empty");
+    if (value?.verdict === "APPROVE" && (worst || Number(value?.criteria?.blockersOpen) > 0)) {
+      errors.push("$.verdict: APPROVE contradicts open BLOCKER/MAJOR points");
+    }
+    if (value?.verdict === "REVISE" && points.length === 0) errors.push("$.points: REVISE requires at least one point");
+  }
+  return errors;
+}
+
+export function parseReplyFile(file, schemaName, { idPrefix } = {}) {
   if (!fs.existsSync(file)) return { parsed: null, errors: [`reply file missing: ${file}`], raw: null };
   const raw = fs.readFileSync(file, "utf8");
   let value;
@@ -68,5 +102,6 @@ export function parseReplyFile(file, schemaName) {
   const errors = validate(loadSchema(schemaName), value);
   const cap = POINT_CAPS[schemaName];
   if (cap && Array.isArray(value?.points) && value.points.length > cap) errors.push(`$.points: more than ${cap} items`);
+  if (errors.length === 0) errors.push(...semanticErrors(schemaName, value, { idPrefix }));
   return { parsed: errors.length === 0 ? value : null, errors, raw };
 }

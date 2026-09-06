@@ -90,3 +90,30 @@ test("the schema retry re-checks the budget before the second model call", () =>
   const appServerCalls = readLog(logFile).filter((c) => c.argv[0] === "app-server").length;
   assert.equal(appServerCalls, 2);
 });
+
+test("a contact whose retry is refused by the budget guard is still booked", () => {
+  const { dir, prompt, logFile } = prepared("retryquota");
+  // First guard query: 18 % used (allowed); the answer is invalid JSON; the guard before the retry sees 97 %.
+  const refused = runTandem(["contact", "--kind", "checkpoint", "--prompt-file", prompt], { cwd: dir, env: { FAKE_CODEX_MODE: "invalid_json", FAKE_USED_PRIMARY_SEQUENCE: "18,97", FAKE_CODEX_LOG: logFile } });
+  assert.equal(refused.json.error, "quota_low");
+  assert.equal(readLog(logFile).filter((c) => c.argv[1] === "resume").length, 1, "exactly one model call happened");
+  const state = JSON.parse(fs.readFileSync(path.join(dir, ".tandem", "state.json"), "utf8"));
+  assert.equal(state.contacts, 1, "the contact that already called the model is booked");
+  assert.equal(state.lastContact.status, "quota_low");
+  const next = runTandem(["contact", "--kind", "checkpoint", "--prompt-file", prompt], { cwd: dir });
+  assert.equal(next.json.contactId, "C2");
+  const early = runTandem(["contact", "--kind", "checkpoint", "--prompt-file", prompt], { cwd: dir, env: { FAKE_USED_PRIMARY: "97" } });
+  assert.equal(early.json.error, "quota_low");
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dir, ".tandem", "state.json"), "utf8")).contacts, 2, "a refusal before any model call does not consume a contact");
+});
+
+test("points must carry the contact's id prefix, otherwise the answer is invalid", () => {
+  const { dir, prompt } = prepared("idprefix");
+  // The fake derives the prefix from the prompt; a CONCERN answer therefore carries C1-1 and passes.
+  const first = runTandem(["contact", "--kind", "checkpoint", "--prompt-file", prompt], { cwd: dir, env: { FAKE_VERDICT: "CONCERN" } });
+  assert.equal(first.json.verdict.points[0].id, "C1-1");
+  const second = runTandem(["contact", "--kind", "checkpoint", "--prompt-file", prompt], { cwd: dir, env: { FAKE_VERDICT: "BLOCK" } });
+  assert.equal(second.json.verdict.verdict, "BLOCK");
+  assert.equal(second.json.verdict.points[0].id, "C2-1");
+  assert.equal(second.json.verdict.points[0].severity, "BLOCKER");
+});

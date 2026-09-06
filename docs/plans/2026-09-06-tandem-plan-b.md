@@ -466,8 +466,8 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: `checkZone`, `MAX_ACTIVE_WORKERS` (Task 2), Schema `worker-result` (Task 1), `resolveCodex`, `killTree`, `parseJsonl`, `classifyFailure`, `threadIdFromEvents`, `buildResumeArgs`, `runCodex`, `minutes`, `normalizeEffort` (codex), `guardActive` (exchange), `ensureBudget`, `minRemainingOf` (ratelimits), `renderTemplate`, `loadState`, `saveState`, `withLock`, `addUsage`, `pidAlive` (state), `extractUsage`.
-- Produces (procs.mjs): `processStartTime(pid) → epochMs|null`, `captureStartTime(pid, { attempts = 10, waitMs = 200 }) → epochMs|null` (wiederholt die Erfassung direkt nach dem Spawn), `sameProcess({ pid, procStart }) → boolean` (PID lebt **und** Startzeit passt ± 5 s; `procStart == null` ⇒ nur Lebendigkeit, nie Identität), `sleepSync(ms)`.
-- Produces (workers.mjs): `TERMINAL_STATUSES`, `ACTIVE_STATUSES` (`running`, `finishing`, `killing`), `REQUIRED_BRIEF_SECTIONS` (10 Überschriften), `missingBriefSections(brief)`, `buildWorkerArgs({ zone, effort, outFile, model })`, `spawnDetachedCodex({ args, stdinFile, logFile, cwd, env }) → { pid, procStart }` (procStart mit Wiederholungen erfasst), `killWorker(worker, env) → { gone: boolean, reason?: "identity_unknown" }` (**tötet nie ohne verifizierte Startzeit**; wartet bis 5 s auf das Ende), `refreshWorkers(state, { project, layout, now, env }) → Promise<boolean>` (async; enthält den Schema-Retry), `bookWorkerUsage(state, worker)`, `cancelWorker(state, worker, env) → { gone }`, `activeZones(state)`, `workerView(worker)`.
+- Produces (procs.mjs): `processStartTime(pid) → epochMs|null` (auf Plattformauflösung gekürzt: ms unter Windows, Sekunden unter POSIX; PowerShell-Timeout 5 s), `captureStartTime(pid, { attempts = 10, waitMs = 200 }) → epochMs|null` (wiederholt die Erfassung direkt nach dem Spawn), `sameProcess({ pid, procStart }) → boolean` (PID lebt **und** Startzeit stimmt **exakt** überein; `procStart == null` ⇒ nur Lebendigkeit, nie Identität), `sleepSync(ms)`.
+- Produces (workers.mjs): `TERMINAL_STATUSES`, `ACTIVE_STATUSES` (`running`, `finishing`, `killing`), `REQUIRED_BRIEF_SECTIONS` (10 Überschriften), `missingBriefSections(brief)`, `buildWorkerArgs({ zone, effort, outFile, model })`, `spawnDetachedCodex({ args, stdinFile, logFile, cwd, env }) → { pid }` (**ohne Shell**: geöffnete Dateideskriptoren für stdin/Log, keine Quoting- oder `%VAR%`-Risiken), `killWorker(worker, env) → { gone: boolean, reason?: "identity_unknown" }` (**tötet nie ohne verifizierte Startzeit**; wartet bis 5 s auf das Ende), `refreshWorkers(state, { project, layout, now, env }) → Promise<boolean>` (async; enthält den Schema-Retry, der bei `paused`/`stopped` ruht), `bookWorkerUsage(state, worker)`, `cancelWorker(state, worker, env) → { gone }`, `activeZones(state)`, `unfinishedWorkers(state)`, `workerView(worker)`. Identität: `worker start` speichert den Datensatz **sofort** nach dem Spawn (`identityPending: true`) und ergänzt `procStart` danach per `captureStartTime(pid, { attempts: 5, waitMs: 200 })`; Vergleich exakt.
 - Worker-Datensatz: `{ id, zone, pid, procStart, identityUnknown?, effort, model, status, startedAt, deadlineAt, briefPath, resultPath, logPath, usageBooked, killReason?, killFailed?, retried?, retryErrors?, result?, errors?, failure?, finishedAt? }`; Zähler `state.workerSeq`. `procStart` wird **nie** nachträglich vom aktuellen PID-Inhaber übernommen.
 - Zustände: `running` → (`finishing` wenn Ergebnis vorhanden, Prozess lebt) → `done|partial|blocked` (Prozess weg, Ergebnis gültig) | `retry_pending` (Ergebnis ungültig, Budget hat den Retry abgelehnt; nicht terminal, Zone frei, Retry beim nächsten Refresh) | `invalid_output` (nach Retry) ; `running` → `killing` (Deadline/Cancel, Kill nicht bestätigt oder Identität unbekannt) → `timeout|cancelled` (Prozess weg) ; `running` → `orphaned|failed` (Prozess weg ohne Ergebnis; `failed` mit `failure` aus dem Log, `quota` pausiert tandem). Ein fehlgeschlagener Retry-Modellaufruf endet `failed` mit `failure` und derselben Quota-Policy (`noteFailure`).
 - Befehl: `worker start --zone <abs> --brief-file <abs> [--effort medium] [--deadline-min 20] [--model <name>] [--min-remaining] [--force]` → `{ worker, activeWorkers }`; `worker status [id]` → `{ workers, active }`; `worker wait <id> [--poll-sec 5] [--timeout-min]` → `{ worker, waitedMs, timedOutWaiting? }`; `worker cancel <id>` → `{ worker, gone }`.
@@ -493,6 +493,9 @@ test("processStartTime reports the start of a live process and null for a dead p
   assert.ok(Math.abs(Date.now() - start) < 60 * 1000, "start time must be recent");
   assert.equal(sameProcess({ pid: child.pid, procStart: start }), true);
   assert.equal(sameProcess({ pid: child.pid, procStart: start - 60 * 1000 }), false, "a different start time means a different process");
+  for (const deltaMs of [1000, 2000, 4000, 5000, -1000]) {
+    assert.equal(sameProcess({ pid: child.pid, procStart: start + deltaMs }), false, `a start time off by ${deltaMs} ms is a foreign process`);
+  }
   assert.equal(sameProcess({ pid: child.pid, procStart: null }), true, "unknown identity only tells liveness (callers must never kill on it)");
   assert.equal(captureStartTime(999999, { attempts: 2, waitMs: 10 }), null);
   child.kill();
@@ -513,19 +516,22 @@ export function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
-// Start time of a process in epoch ms, or null when it does not exist. Pids are recycled; the start time
-// makes the identity of a worker verifiable before it is killed or declared alive.
+// Start time of a process in epoch ms (truncated to the platform's resolution: ms on Windows, seconds on
+// POSIX), or null when it does not exist. Pids are recycled; the start time makes the identity of a worker
+// verifiable before it is killed or declared alive. The same source and truncation are used for capture and
+// later checks, so identities are compared EXACTLY.
 export function processStartTime(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return null;
   if (process.platform === "win32") {
     const script = `try { (Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToUniversalTime().ToString('o') } catch { '' }`;
-    const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { encoding: "utf8", windowsHide: true, timeout: 15000 });
-    const ms = Date.parse(String(result.stdout ?? "").trim());
+    const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { encoding: "utf8", windowsHide: true, timeout: 5000 });
+    const iso = String(result.stdout ?? "").trim().replace(/(\.\d{3})\d+/, "$1"); // keep ms, drop 100-ns digits
+    const ms = Date.parse(iso);
     return Number.isFinite(ms) ? ms : null;
   }
   const result = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8" });
   const ms = Date.parse(String(result.stdout ?? "").trim());
-  return Number.isFinite(ms) ? ms : null;
+  return Number.isFinite(ms) ? Math.floor(ms / 1000) * 1000 : null;
 }
 
 // Right after a spawn the process may not be visible yet; retry briefly. Returns null when it never was.
@@ -539,14 +545,14 @@ export function captureStartTime(pid, { attempts = 10, waitMs = 200 } = {}) {
   return null;
 }
 
-// True only when the pid is alive AND the start time matches within 5 s. With an unknown identity
-// (procStart null) this only reports liveness; callers must never kill on that basis.
+// True only when the pid is alive AND the start time matches EXACTLY (same source, same truncation). With an
+// unknown identity (procStart null) this only reports liveness; callers must never kill on that basis.
 export function sameProcess({ pid, procStart }) {
   if (!pidAlive(pid)) return false;
   if (procStart === null || procStart === undefined) return true;
   const start = processStartTime(pid);
   if (start === null) return false;
-  return Math.abs(start - procStart) <= 5000;
+  return start === procStart;
 }
 ```
 
@@ -763,6 +769,35 @@ test("a failed kill keeps the worker active as 'killing' and the zone reserved; 
   killTree(pid); // clean up the (still running) fake tree ourselves
 });
 
+test("worker paths are passed verbatim (no shell): a %VAR%-looking zone name stays literal", () => {
+  const { dir, brief, logFile } = prepared("worker-percent");
+  const zone = path.join(dir, "z%USERNAME%z");
+  fs.mkdirSync(zone);
+  const started = runTandem(["worker", "start", "--zone", zone, "--brief-file", brief], { cwd: dir, env: { FAKE_CODEX_LOG: logFile, FAKE_WORKER_WRITE: "1" } });
+  assert.equal(started.json.ok, true, JSON.stringify(started.json));
+  const waited = runTandem(["worker", "wait", started.json.worker.id, "--poll-sec", "1"], { cwd: dir });
+  assert.equal(waited.json.worker.status, "done");
+  const call = readLog(logFile).find((c) => c.argv[0] === "exec");
+  assert.equal(call.argv[call.argv.indexOf("-C") + 1].toLowerCase(), fs.realpathSync.native(zone).toLowerCase(), "the zone reached codex unexpanded");
+  assert.ok(fs.existsSync(path.join(zone, "ok.txt")), "the worker wrote into the literal zone");
+});
+
+test("a pending retry rests while paused and is cancelled by stop (no model call either way)", () => {
+  const { dir, zone, brief, logFile } = prepared("worker-retry-paused");
+  const onceFlag = path.join(dir, "invalid-once.flag");
+  const env = { FAKE_CODEX_LOG: logFile, FAKE_WORKER_INVALID_ONCE: onceFlag, FAKE_USED_PRIMARY_SEQUENCE: "18,97,18,18" };
+  const w1 = runTandem(["worker", "start", "--zone", zone, "--brief-file", brief], { cwd: dir, env });
+  assert.equal(runTandem(["worker", "wait", w1.json.worker.id, "--poll-sec", "1"], { cwd: dir, env }).json.worker.status, "retry_pending");
+  runTandem(["pause"], { cwd: dir });
+  assert.equal(runTandem(["status"], { cwd: dir, env }).json.workers[0].status, "retry_pending", "paused: the retry must rest");
+  assert.equal(runTandem(["worker", "status"], { cwd: dir, env }).json.workers[0].status, "retry_pending");
+  assert.equal(readLog(logFile).filter((c) => c.argv[1] === "resume").length, 0, "no model call while paused");
+  const stopped = runTandem(["stop"], { cwd: dir, env });
+  assert.equal(stopped.json.cancelledWorkers, 1);
+  assert.equal(runTandem(["status"], { cwd: dir, env }).json.workers[0].status, "cancelled");
+  assert.equal(readLog(logFile).filter((c) => c.argv[1] === "resume").length, 0, "stop never triggers the retry");
+});
+
 test("a worker without a captured identity is never killed and its identity is never filled in later", () => {
   const { dir, zone, brief } = prepared("worker-identity");
   const a = runTandem(["worker", "start", "--zone", zone, "--brief-file", brief, "--deadline-min", "5"], { cwd: dir, env: { FAKE_CODEX_MODE: "hang" } });
@@ -821,8 +856,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { buildResumeArgs, classifyFailure, killTree, parseJsonl, resolveCodex, runCodex, threadIdFromEvents } from "./codex.mjs";
 import { noteFailure } from "./exchange.mjs";
-import { TandemError } from "./output.mjs";
-import { captureStartTime, sameProcess, sleepSync } from "./procs.mjs";
+import { sameProcess, sleepSync } from "./procs.mjs";
 import { ensureBudget } from "./ratelimits.mjs";
 import { parseReplyFile, schemaPath } from "./schema.mjs";
 import { addUsage } from "./state.mjs";
@@ -851,35 +885,23 @@ export function buildWorkerArgs({ zone, effort, outFile, model = null }) {
   ];
 }
 
-function winQuote(arg) {
-  const text = String(arg);
-  return /[\s&|<>^()]/.test(text) ? `"${text}"` : text;
-}
-
-function shQuote(arg) {
-  return `'${String(arg).replace(/'/g, `'\\''`)}'`;
-}
-
-// Starts codex detached: stdin from the brief file, stdout and stderr into the log file. The runner returns
-// immediately; the process lives on. Windows: a cmd.exe wrapper performs the redirects and its pid heads the
-// tree that `taskkill /T` kills. POSIX: `sh -c exec …`, so the pid IS codex and leads its own process group.
-// The start time of the spawned process is recorded as its identity.
+// Starts codex detached WITHOUT any shell: stdin is the opened brief file, stdout and stderr are the opened
+// log file (inherited descriptors), so no cmd.exe/sh quoting or %VAR% expansion can ever rewrite a validated
+// path. The pid is the codex launcher itself (`taskkill /T` kills its tree; on POSIX the detached process
+// leads its own group). Identity (start time) is captured by the caller AFTER the record is persisted.
 export function spawnDetachedCodex({ args, stdinFile, logFile, cwd, env = process.env }) {
   const { cmd, prefix } = resolveCodex(env);
-  const full = [cmd, ...prefix, ...args];
+  const inFd = fs.openSync(stdinFile, "r");
+  const outFd = fs.openSync(logFile, "a");
   let child;
-  if (process.platform === "win32") {
-    for (const arg of [...full, stdinFile, logFile]) {
-      if (String(arg).includes('"')) throw new TandemError("bad_path", `Double quotes are not allowed in worker paths: ${arg}`);
-    }
-    const line = `${full.map(winQuote).join(" ")} < ${winQuote(stdinFile)} > ${winQuote(logFile)} 2>&1`;
-    child = spawn("cmd.exe", ["/d", "/s", "/c", `"${line}"`], { cwd, env, detached: true, stdio: "ignore", windowsHide: true, windowsVerbatimArguments: true });
-  } else {
-    const line = `exec ${full.map(shQuote).join(" ")} < ${shQuote(stdinFile)} > ${shQuote(logFile)} 2>&1`;
-    child = spawn("/bin/sh", ["-c", line], { cwd, env, detached: true, stdio: "ignore" });
+  try {
+    child = spawn(cmd, [...prefix, ...args], { cwd, env, detached: true, stdio: [inFd, outFd, outFd], windowsHide: true });
+  } finally {
+    fs.closeSync(inFd);
+    fs.closeSync(outFd);
   }
   child.unref();
-  return { pid: child.pid, procStart: captureStartTime(child.pid) };
+  return { pid: child.pid };
 }
 
 function readLogText(logPath) {
@@ -966,10 +988,12 @@ async function settleResult(state, worker, { project, layout, env, now }) {
 }
 
 // Brings every non-terminal worker up to date. Terminal only after the process is verifiably gone.
+// Pending schema retries are model calls: they rest while tandem is paused or stopped.
 export async function refreshWorkers(state, { project, layout, now = Date.now(), env = process.env } = {}) {
   let changed = false;
   for (const worker of state.workers ?? []) {
     if (worker.status === "retry_pending") {
+      if (state.paused || state.stopped) continue;
       await settleResult(state, worker, { project, layout, env, now });
       changed = worker.status !== "retry_pending" || changed;
       continue;
@@ -1026,6 +1050,11 @@ export function activeZones(state) {
   return (state.workers ?? []).filter((w) => ACTIVE_STATUSES.has(w.status)).map((w) => w.zone);
 }
 
+// Everything that is not finished yet: active workers plus pending retries (used by `stop`).
+export function unfinishedWorkers(state) {
+  return (state.workers ?? []).filter((w) => ACTIVE_STATUSES.has(w.status) || w.status === "retry_pending");
+}
+
 export function workerView(worker) {
   const { usageBooked, ...view } = worker;
   return view;
@@ -1043,6 +1072,7 @@ import { TandemError } from "../lib/output.mjs";
 import { ensureLayout, requireAbsolute } from "../lib/paths.mjs";
 import { renderTemplate } from "../lib/prompts.mjs";
 import { ensureBudget, minRemainingOf } from "../lib/ratelimits.mjs";
+import { captureStartTime } from "../lib/procs.mjs";
 import { loadState, saveState, withLock } from "../lib/state.mjs";
 import {
   ACTIVE_STATUSES, activeZones, buildWorkerArgs, cancelWorker, missingBriefSections, refreshWorkers, spawnDetachedCodex, workerView
@@ -1105,14 +1135,20 @@ async function start({ project, options }) {
     const logPath = path.join(dir, "log.txt");
     const realProject = fs.realpathSync.native(project);
     fs.writeFileSync(briefPath, `${brief.trimEnd()}\n\n${renderTemplate("worker-contract", { PROJECT: realProject, ZONE: zone, WORKER_ID: id })}`, "utf8");
-    const { pid, procStart } = spawnDetachedCodex({ args: buildWorkerArgs({ zone, effort, outFile: resultPath, model }), stdinFile: briefPath, logFile: logPath, cwd: zone });
+    const { pid } = spawnDetachedCodex({ args: buildWorkerArgs({ zone, effort, outFile: resultPath, model }), stdinFile: briefPath, logFile: logPath, cwd: zone });
     const now = Date.now();
+    // Persist the record FIRST (pid, deadline, zone), so a runner crash never leaves an unregistered
+    // write-capable process; the identity is added right after.
     const worker = {
-      id, zone, pid, procStart, effort, model, status: "running",
+      id, zone, pid, procStart: null, identityPending: true, effort, model, status: "running",
       startedAt: new Date(now).toISOString(), deadlineAt: new Date(now + deadlineMs).toISOString(),
       briefPath, resultPath, logPath, usageBooked: false
     };
     state.workers.push(worker);
+    saveState(project, state);
+    worker.procStart = captureStartTime(pid, { attempts: 5, waitMs: 200 });
+    worker.identityPending = false;
+    if (worker.procStart === null) worker.identityUnknown = true; // never killed, zone stays reserved until it exits
     saveState(project, state);
     return { worker: workerView(worker), activeWorkers: active.length + 1 };
   });
@@ -1139,7 +1175,7 @@ async function wait({ project, positionals, options }) {
       await refreshAndSave(project, state);
       return workerView(worker);
     });
-    if (!ACTIVE_STATUSES.has(view.status)) return { worker: view, waitedMs: Date.now() - started };
+    if (!ACTIVE_STATUSES.has(view.status)) return { worker: view, waitedMs: Date.now() - started }; // retry_pending returns too: the caller decides
     limit ??= Date.parse(view.deadlineAt) + 90 * 1000; // the refresh marks a timeout at the deadline
     if (Date.now() > limit) return { worker: view, waitedMs: Date.now() - started, timedOutWaiting: true };
     await new Promise((resolve) => setTimeout(resolve, pollMs));
@@ -1171,7 +1207,7 @@ Import `import { runWorker } from "./commands/worker.mjs";` und in `COMMANDS`: `
 - [ ] **Step 9: Tests laufen lassen, Erfolg prüfen**
 
 Run: `node --test tests/procs.test.mjs tests/worker.test.mjs`
-Expected: `# pass 11`, `# fail 0` (Linger-, Timeout- und Kill-Fälle dauern zusammen ~30 s).
+Expected: `# pass 13`, `# fail 0` (Linger-, Timeout- und Kill-Fälle dauern zusammen ~35 s).
 
 - [ ] **Step 10: Commit**
 
@@ -1496,13 +1532,12 @@ export async function runStatus({ project, options }) {
 
 - [ ] **Step 4: control.mjs anpassen**
 
-Import `import { ACTIVE_STATUSES, cancelWorker } from "../lib/workers.mjs";`. Vor `if (command === "mode")` die Zähler `let cancelledWorkers = 0; let unresolvedWorkers = 0;` anlegen; den `stop`-Zweig ersetzen:
+Import `import { cancelWorker, unfinishedWorkers } from "../lib/workers.mjs";`. Vor `if (command === "mode")` die Zähler `let cancelledWorkers = 0; let unresolvedWorkers = 0;` anlegen; den `stop`-Zweig ersetzen (bricht aktive Worker **und** ausstehende Retries ab):
 ```js
     } else if (command === "stop") {
       state.paused = true;
       state.stopped = true;
-      for (const worker of state.workers ?? []) {
-        if (!ACTIVE_STATUSES.has(worker.status)) continue;
+      for (const worker of unfinishedWorkers(state)) {
         if (cancelWorker(state, worker).gone) cancelledWorkers += 1;
         else unresolvedWorkers += 1;
       }
@@ -1744,6 +1779,12 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 2. Smoke gegen echtes Codex auf Zuruf: `node tests/smoke-workers.mjs C:\Users\david\tandem-smoke` (low effort), danach Ordner löschen. Prüft `codex exec fork --ephemeral` mit Schema (Spec 12.2), einen echten Worker in einer Zone und den sicheren Isolations-Negativtest (`../leak.txt` muss blockiert werden).
 3. Abschluss nach Spec 4.5 mit tandem selbst: `review --base main` auf dem Branch und `contact --kind final` auf dem Dauer-Thread des Skill-Repos; echte Befunde fixen, bis das Schlussurteil OK ist.
 4. Merge nach `main`, Push nach GitHub, Datum in „Abnahme Plan B" eintragen.
+
+## Plan-Konsens (Runde 3, 2026-09-06): kein Konsens nach drei Runden — Entscheidung des Nutzers: P3-1 bis P3-4 übernehmen und bauen
+- P3-1: Startzeit wird auf Plattformauflösung gekürzt und **exakt** verglichen; Test mit Abweichungen von 1–5 s ⇒ fremd.
+- P3-2: Worker-Start ohne Shell (Dateideskriptoren statt cmd.exe/sh-Redirects); Test mit `%USERNAME%`-Zonenname bleibt literal.
+- P3-3: `retry_pending` ruht bei `paused`/`stopped`; `stop` bricht auch ausstehende Retries ab (`unfinishedWorkers`); Tests mit null Resume-Aufrufen.
+- P3-4: Worker-Datensatz wird sofort nach dem Spawn gespeichert (`identityPending`), Identität danach mit 5 × 200 ms und 5-s-PowerShell-Timeout ergänzt.
 
 ## Plan-Konsens (Runde 2, 2026-09-06): Einwände P2-1 bis P2-4, alle übernommen
 - P2-1: `captureStartTime` wiederholt die Erfassung nach dem Spawn; ohne verifizierte Startzeit wird nie gekillt (`killing` mit `killBlockedBy: identity_unknown`, Zone reserviert); `procStart` wird nie nachträglich vom aktuellen PID-Inhaber übernommen.

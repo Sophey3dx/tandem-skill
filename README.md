@@ -20,7 +20,7 @@ Tandem fixes all three: a persistent thread, a contact protocol with schema-vali
 
 ---
 
-## What is in this release (Plan A, the core)
+## What is in this release (core plus work split)
 
 | Capability | What it does |
 |------------|--------------|
@@ -28,13 +28,31 @@ Tandem fixes all three: a persistent thread, a contact protocol with schema-vali
 | **Plan consensus with automode** | A plan travels between Claude and Codex for at most three rounds. Codex answers `APPROVE / REVISE`; the runner computes a hard `consensus` flag (no open BLOCKER/MAJOR, sources read, test strategy feasible, residual risk named). On consensus the plan is executed without a human stop. No consensus after round three: both positions go to the user. |
 | **Two final verdicts** | The persistent thread checks goal fidelity and earlier objections; a fresh Codex thread with an explicit review contract reads the real diff and looks for bugs without conversation bias. |
 | **Sparring and lanes** | Free-form questions on the persistent thread, plus ephemeral forks of it (counter-position, premortem, alternative) whose answers never pollute the main thread. |
-| **Work split** | Codex workers implement bounded tasks with write access, detached and in parallel (max. two), confined by the OS sandbox to a zone folder the runner validates (real paths, no shared caches, no reparse points, no hard-linked files, no special files such as sockets or FIFOs, never under TEMP). No shell in the spawn path. The record is reserved in the state before the process exists, and the launcher creates `launched.json` exclusively before Codex starts (fail-closed: no marker, no start; a record the runner gave up carries an *abandoned* marker under the same name, so a launcher scheduled late never starts into a zone that is free again). No descendant outlives a worker, enforced by the OS: on Windows Codex runs inside a Job Object with kill-on-close (`scripts/lib/win-job-run.ps1`, created suspended and assigned before it runs); on Linux inside a transient systemd user scope (a cgroup, which a `setsid` cannot leave) that is killed as a whole when Codex ends and must be *confirmed* gone before the exit is reported: `systemctl --user is-active` reporting inactive or failed, or the collected unit being provably not loaded any more (`LoadState=not-found`); a manager that does not answer counts as unknown, never as gone. Until confirmation the launcher stays alive as a sentinel, and the runner treats a worker whose scope is active or unknown as alive (zone reserved; a cancel or timeout stays `killing` with `scope_unconfirmed`). The runner itself only ever takes one short look and one short kill per refresh (3 s timeouts), so the state lock is never held for a slow manager. Where neither exists (macOS, Linux without a systemd user manager) `worker start` refuses with `unconfined_platform`; `TANDEM_ALLOW_UNCONFINED_WORKERS=1` overrides that deliberately, and then only the process group and the reachable process tree are cleaned up. Process identity is pid plus exact start time: Windows in milliseconds, Linux in clock ticks from `/proc/<pid>/stat` (10 ms), other POSIX in whole seconds from `ps` (a pid reused within the same second is not distinguishable there). Process identity is verified (pid + exact start time) before anything is killed; a zone stays reserved until the process is provably gone. Structured `DONE / PARTIAL / BLOCKED` results with tests and touched files; one budget-checked schema retry. Tasks are allocated by strength: Codex gets test-writing, parsers and converters against a spec, ports, migrations, repo research and audits; Claude keeps UI, cross-cutting changes, architecture, integration and everything that needs the user. Optional `--model` per worker. |
+| **Work split** | Codex workers implement bounded tasks with write access, detached and in parallel (max. two), confined by the OS sandbox to a zone folder. Structured `DONE / PARTIAL / BLOCKED` results with tests and touched files; one budget-checked schema retry. Tasks are allocated by strength: Codex gets test-writing, parsers and converters against a spec, ports, migrations, repo research and audits; Claude keeps UI, cross-cutting changes, architecture, integration and everything that needs the user. Optional `--model` per worker. What the runner guarantees around a worker is its own section: *Worker safety*. |
 | **Cost counter** | Token usage per Codex run, summed in total, per contact kind and per session. |
 | **Usage guard** | Before every model call the runner asks the Codex app-server for the remaining quota (5-hour and weekly windows). Below the threshold (default 10 %) it refuses with `quota_low` and the reset time. |
 | **State, lock, rotation** | Atomic state file with backup, cross-process lock, thread history, rotation to a fresh thread seeded from the ledger. |
 | **Safety** | The tandem thread is always read-only. Claude applies changes; Codex only advises. Failed contacts are recorded, never silently retried. |
 
 Planned next (see the [design spec](docs/2026-09-06-tandem-design.md)): a **design gallery** (both agents build a UI variant, you compare them side by side, standalone or as a Vite entry) and a **board** that shows the Claude ↔ Codex timeline in the browser.
+
+---
+
+## Worker safety
+
+A worker is the only part of tandem that writes on its own, so its blast radius got the most review. Six properties, each enforced by the runner rather than by a prompt:
+
+**The zone is a real folder inside the project, and nothing else.** `worker start` resolves real paths, so an ancestor junction cannot move the zone elsewhere. It rejects the project root, `.tandem/` (except a design round's own Codex folder), shared build and cache folders, anything under TEMP, overlaps with another active zone, reparse points, hard-linked files, and special files such as sockets or FIFOs. Anything that cannot be inspected rejects the zone: the sandbox can only confine what the runner knows about.
+
+**No shell is ever involved.** The launcher is spawned with inherited descriptors, stdin being the brief file and stdout/stderr the log, so no quoting rule and no environment expansion can rewrite a validated path.
+
+**A write-capable process is always registered.** The state record is reserved before the process exists, and the launcher creates its marker file exclusively before Codex starts: no marker, no start. If the runner dies mid-start, the next refresh either adopts the launcher's pid or claims the marker itself, so a launcher scheduled late can never start into a zone that is free again. Anything ambiguous keeps the record reserved and is re-checked, never released.
+
+**No descendant outlives a worker, enforced by the OS.** On Windows Codex runs inside a Job Object with kill-on-close, created suspended and assigned to the job before it runs. On Linux it runs inside a transient systemd user scope, a cgroup a `setsid` cannot leave, which is killed as a whole and must be confirmed gone before the worker is reported finished; until then the launcher stays alive as a sentinel. Where neither mechanism exists, `worker start` refuses with `unconfined_platform` unless `TANDEM_ALLOW_UNCONFINED_WORKERS=1` says otherwise.
+
+**Nothing is killed without a verified identity.** A worker is a pid plus an exact start time: milliseconds on Windows, clock ticks from `/proc` on Linux, whole seconds from `ps` elsewhere. A recycled pid counts as "our worker is gone", never as a target, and an identity that cannot be verified right now leaves the kill pending instead of guessing.
+
+**A zone is released only when nothing can write into it any more.** A result while the process still runs means `finishing`, not done. A cancel or deadline that cannot be confirmed stays `killing` and keeps the zone. A worker that finished keeps its report even when a cancel arrives in the same moment.
 
 ---
 
@@ -108,7 +126,7 @@ All Codex calls go through `scripts/tandem.mjs`. It prints exactly one JSON line
 | `contact --kind sparring --prompt-file <abs>` | Free-form question with the sparring schema (position, reasons, risks, recommendation). |
 | `lane --kind gegenposition\|premortem\|alternative --prompt-file <abs>` | Ephemeral fork of the thread; one schema retry by forking again. |
 | `worker start --zone <abs> --brief-file <abs> [--effort] [--deadline-min 20] [--model <name>]` | Validates the zone and the brief (ten mandatory headings), appends the worker contract, starts Codex detached with `workspace-write` confined to the zone. |
-| `worker status [id]`, `worker wait <id> [--poll-sec 5]`, `worker cancel <id>` | Lifecycle: results are validated after the process exits, deadlines and cancels kill the verified process tree and wait for it to disappear, usage is booked from the log, which is read as a bounded window (first 64 KB, last 2 MB) exactly once per refresh. `cancel` and `stop` refresh first and keep the report of a worker that already finished (it ends as `done`, not `cancelled`). A worker in `killing` is killed again on every refresh as soon as its identity is verifiable; the schema retry rests while tandem is paused or stopped, even for a worker seen finished for the first time. The exit code of the detached process is recorded (`exitCode`, appended to the log by a tiny launcher), and a report that Codex left only in its log is accepted as `resultSource: "log"`. |
+| `worker status [id]`, `worker wait <id> [--poll-sec 5]`, `worker cancel <id>` | Lifecycle: the result is validated once the process is gone, deadlines and cancels kill the verified process tree and wait for it to disappear, usage is booked from the log, which is read as a bounded window (first 64 KB, last 2 MB) exactly once per refresh. The exit code of the detached process is recorded as `exitCode`, and a report Codex left only in its log is accepted as `resultSource: "log"`. See *Worker safety* for the guarantees. |
 
 ### Contact envelope
 

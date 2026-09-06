@@ -234,7 +234,7 @@ Alle Befehle: `--project <abs>` optional (default: cwd), Ausgabe eine JSON-Zeile
 | Limit/Quota erreicht (trotz Wächter) | Fehlertext (Rate-Limit/Usage-Limit) in stderr/JSONL | `state.paused = true`, `error: quota`; Claude informiert den Nutzer, arbeitet ohne Checkpoints weiter, Ledger „degradiert seit …" |
 | Hängender Prozess | Deadline je Kontakt-Typ überschritten | Prozessbaum beenden, Kontakt „timeout"; bei Workern Diff prüfen; **ein** manueller Neuversuch, nie blind wiederholen |
 | Ungültige Antwort trotz Schema | Runner-Validierung | ein Wiederholungsversuch mit Schema-Hinweis, sonst „failed" |
-| Codex-Version gewechselt | `doctor`/`start`/`contact` vergleicht mit `state.codexVersion` | Vermerk + Smoke-Kontakt (Effort low) |
+| Codex-Version gewechselt | `doctor` und `start` vergleichen mit `state.codexVersion` | Vermerk (`versionChanged`) + Smoke-Kontakt (Effort low) |
 | Zustand beschädigt | JSON-Parse-Fehler | Runner bricht ab, `error: state_corrupt`, Hinweis auf `state.json.bak` (der Runner hält eine Sicherung des letzten gültigen Zustands) |
 | Veralteter Lock | PID nicht mehr lebend oder Lock älter als 30 min | Lock entfernen, weiter |
 | Verwaister Worker | PID tot, kein `result.json` | Status „orphaned"; Claude prüft Diff der Zone |

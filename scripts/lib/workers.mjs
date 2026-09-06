@@ -53,7 +53,9 @@ export async function spawnDetachedCodex({ args, stdinFile, logFile, cwd, env = 
   const outFd = fs.openSync(logFile, "a");
   let child;
   try {
-    child = spawn(process.execPath, [LAUNCHER, logFile, cmd, ...prefix, ...args], { cwd, env, detached: true, stdio: [inFd, outFd, outFd], windowsHide: true });
+    // detached: on POSIX the launcher leads its own process group (TANDEM_LAUNCH_GROUP tells it so); on
+    // Windows it runs codex inside a Job Object. Either way no descendant outlives the worker.
+    child = spawn(process.execPath, [LAUNCHER, logFile, cmd, ...prefix, ...args], { cwd, env: { ...env, TANDEM_LAUNCH_GROUP: "1" }, detached: true, stdio: [inFd, outFd, outFd], windowsHide: true });
     await new Promise((resolve, reject) => {
       child.once("spawn", resolve);
       child.once("error", reject);
@@ -217,6 +219,11 @@ async function settleGone(state, worker, ctx, fallback) {
 }
 
 function orphanOrFail(state, worker, now, exit) {
+  // The launcher could not start codex at all (marker not writable, binary missing, job setup failed).
+  if (exit?.error) {
+    finish(state, worker, "failed", now, { failure: "spawn_failed", errors: [exit.error] });
+    return;
+  }
   // Exit code 0 without any report is "no_result"; a missing exit record (launcher killed) counts as 1.
   const failure = classifyFailure({ status: exit?.code ?? 1, timedOut: false, stderr: readLogText(worker.logPath) }) ?? "no_result";
   if (failure === "quota") state.paused = true;

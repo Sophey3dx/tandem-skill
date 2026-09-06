@@ -476,3 +476,17 @@ test("a launcher that cannot be started rejects with the spawn error instead of 
     /ENOENT/
   );
 });
+
+test("a worker whose launch marker cannot be written ends as failed/spawn_failed and codex is never called", () => {
+  const { dir, zone, brief, logFile } = prepared("worker-marker-fail");
+  fs.mkdirSync(path.join(dir, ".tandem", "workers", "W1", "launched.json"), { recursive: true }); // marker path is a directory
+  const started = runTandem(["worker", "start", "--zone", zone, "--brief-file", brief], { cwd: dir, env: { FAKE_CODEX_LOG: logFile } });
+  assert.equal(started.json.ok, true, JSON.stringify(started.json));
+  const waited = runTandem(["worker", "wait", "W1", "--poll-sec", "1"], { cwd: dir, env: { FAKE_CODEX_LOG: logFile } });
+  assert.equal(waited.json.worker.status, "failed", JSON.stringify(waited.json.worker));
+  assert.equal(waited.json.worker.failure, "spawn_failed");
+  assert.match(waited.json.worker.errors[0], /launch marker not writable/);
+  assert.equal(waited.json.worker.exitCode, 65);
+  assert.equal(readLog(logFile).filter((c) => c.argv[0] === "exec").length, 0, "codex never started");
+  assert.equal(runTandem(["worker", "status"], { cwd: dir }).json.active, 0, "zone released only after the verdict");
+});

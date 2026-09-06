@@ -87,14 +87,15 @@ function isStale(lock) {
   return lock.pid === process.pid || !pidAlive(lock.pid) || age > LOCK_STALE_MS;
 }
 
-// Atomic: the lock file is created with "wx" (fails if it exists). A stale lock is removed once and the
-// creation retried. Release only deletes the file if it still carries our token.
+// Atomic: the lock file is created with "wx" (fails if it exists). A stale lock is removed only while it
+// still holds exactly the content that was inspected (another process may have replaced it with a live lock
+// in the meantime), then the creation is retried. Release only deletes the file if it still carries our token.
 export function acquireLock(projectRoot) {
   const { root, lockFile } = tandemLayout(projectRoot);
   fs.mkdirSync(root, { recursive: true });
   const token = `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
   const payload = JSON.stringify({ pid: process.pid, at: new Date().toISOString(), token });
-  for (let attempt = 0; attempt < 2; attempt += 1) {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
       const fd = fs.openSync(lockFile, "wx");
       fs.writeSync(fd, payload);
@@ -117,6 +118,8 @@ export function acquireLock(projectRoot) {
           "Wait for it to finish, or delete .tandem/lock if that process is dead."
         );
       }
+      const current = readLock(lockFile);
+      if (JSON.stringify(current) !== JSON.stringify(existing)) continue; // replaced meanwhile: re-inspect
       try {
         fs.unlinkSync(lockFile);
       } catch {

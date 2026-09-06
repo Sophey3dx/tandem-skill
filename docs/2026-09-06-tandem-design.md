@@ -151,7 +151,7 @@ Codex liest die Dateien selbst (read-only). Antwort nach `verdict.schema.json`.
 
 ### 4.5 Abschluss: zwei unabhängige Urteile
 1. **Dauer-Thread** (`contact --kind final`, Effort medium, high bei Security/Daten/Concurrency): prüft Zieltreue, Umsetzung angenommener Einwände, offene Punkte.
-2. **Frischer Diff-Review** (`review --uncommitted` bzw. `--base`, ohne Gesprächsbias): sucht echte Bugs im Diff. Ohne Git: `contact --kind final` mit Dateiliste und Diff-Auszug.
+2. **Frischer Diff-Review** (`review --uncommitted` bzw. `--base`, ohne Gesprächsbias): ein frischer `codex exec`-Thread mit Review-Vertrag liest den Diff selbst und sucht echte Bugs (nicht `codex exec review`, das das Ausgabeschema ignoriert); ein Schema-Retry resumiert diesen Thread. Ohne Git: `contact --kind final` mit Dateiliste und Diff-Auszug.
 Claude führt beide Ergebnisse mit Fix-Disposition im Ledger zusammen und fixt echte Bugs selbst. Greift zusammen mit `superpowers:verification-before-completion`. Ersetzt den Duofold-/Trifold-Abschluss-Bug-Check, solange tandem aktiv ist.
 
 ### 4.6 Design-Galerie (`/tandem design <thema> [--vite]`)
@@ -352,7 +352,7 @@ Jeder Prompt enthält einen **Output-Cap** (max. Punkte, max. Zeilen). Die Anzah
 
 ## 12. Bei der Implementierung zu verifizieren
 
-1. `codex exec review --uncommitted` zusammen mit `--output-schema` und `-o` (Duofold-Notiz: `--uncommitted` schließt einen eigenen `[PROMPT]` aus; das Schema sollte davon unberührt sein).
+1. ~~`codex exec review --uncommitted` zusammen mit `--output-schema` und `-o`~~ **Geklärt 2026-09-06 (Dogfooding):** `codex exec review` ignoriert `--output-schema`, die Endnachricht ist Prosa. Der Abschluss-Review läuft daher als frischer `codex exec`-Thread mit eigenem Review-Vertrag (`templates/review.md`), der den echten Diff selbst per `git diff` liest, und dem `verdict`-Schema; ein Schema-Retry resumiert diesen Review-Thread.
 2. `codex exec fork --ephemeral`: Lane wird nicht persistiert, Hauptthread bleibt unverändert.
 3. Exakter Fehlertext bei Limit/Quota und bei nicht auffindbarem Thread (für die Klassifikation).
 4. Detached Worker unter Windows: Start via `cmd /c` mit stdin-Redirect aus der Brief-Datei, `detached: true`, `unref()`; Prozessbaum-Kill per `taskkill /T /F`.

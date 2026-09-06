@@ -11,8 +11,8 @@ Der Runner hüllt Claudes Prompt-Datei (`BODY`) in Kontakt-ID, Art, Schema-Name 
 ## Planrunde (`templates/plan-round.md`, `templates/plan-matrix.md`)
 Runde 1 bekommt den vollen Plan (Effort high), Runden 2–3 den vollen überarbeiteten Plan plus Matrix (`Einwand-ID → accepted|rejected|deferred + Grund`). Antwort nach `schemas/plan-verdict.schema.json`: `verdict APPROVE|REVISE`, `criteria{blockersOpen,sourcesRead,testStrategyFeasible,residualRisk}`, `points[{id,severity,category,text,section,newEvidence}]` (≤ 8). Konsens berechnet der Runner: APPROVE, `blockersOpen = 0`, Quellen gelesen, Teststrategie machbar, Restrisiko benannt, kein BLOCKER/MAJOR-Punkt.
 
-## Abschluss
-Zwei Urteile: `contact --kind final` (Thread, Zieltreue) und `review` (frischer `codex exec review`, Diff-Bugs). Beide nach `verdict`-Schema.
+## Abschluss (`templates/review.md`)
+Zwei Urteile: `contact --kind final` (Thread, Zieltreue) und `review` (frischer `codex exec`-Thread mit Review-Vertrag; liest den Diff selbst per `git diff`, sucht echte Bugs, keine Stilkommentare; genau ein Schema-Retry per Resume dieses Threads). Beide nach `verdict`-Schema; Review-Punkte heißen `R-1`, `R-2`, …
 
 ## Antwort-Regeln für Codex (in allen Vorlagen)
 Deutsch, knapp, erst lesen, dann urteilen, `checked` ehrlich füllen, keine Skill-Rituale, ausschließlich JSON wenn ein Schema vorgegeben ist.

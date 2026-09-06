@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { buildStartArgs, failureToError, minutes, normalizeEffort, readLastMessage, runCodex, threadIdFromEvents } from "../lib/codex.mjs";
-import { recordFailedContact } from "../lib/exchange.mjs";
+import { noteFailure, recordFailedContact } from "../lib/exchange.mjs";
 import { TandemError } from "../lib/output.mjs";
 import { ensureLayout, requireAbsolute, stamp } from "../lib/paths.mjs";
 import { renderTemplate } from "../lib/prompts.mjs";
@@ -34,6 +34,7 @@ export async function runRotate({ project, options }) {
     const result = await runCodex({ args: buildStartArgs({ project, effort, outFile }), promptFile, cwd: project, timeoutMs, logFile: path.join(layout.replies, `${base}.log`) });
     addUsage(state, "rotate", extractUsage(result));
     if (result.failure) {
+      noteFailure(state, result);
       recordFailedContact(state, { n, contactId: `C${n}`, kind: "rotate", outFile, effort, result });
       saveState(project, state);
       throw failureToError(result, "rotate");

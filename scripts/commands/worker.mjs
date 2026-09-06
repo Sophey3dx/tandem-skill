@@ -89,7 +89,7 @@ async function start({ project, options }) {
     // 2. Start the process.
     let pid;
     try {
-      ({ pid } = spawnDetachedCodex({ args: buildWorkerArgs({ zone, effort, outFile: resultPath, model }), stdinFile: briefPath, logFile: logPath, cwd: zone }));
+      ({ pid } = await spawnDetachedCodex({ args: buildWorkerArgs({ zone, effort, outFile: resultPath, model }), stdinFile: briefPath, logFile: logPath, cwd: zone }));
     } catch (error) {
       Object.assign(worker, { status: "failed", failure: "spawn_failed", errors: [error.message], finishedAt: new Date().toISOString() });
       saveState(project, state);

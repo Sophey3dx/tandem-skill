@@ -108,7 +108,7 @@ All Codex calls go through `scripts/tandem.mjs`. It prints exactly one JSON line
 | `contact --kind sparring --prompt-file <abs>` | Free-form question with the sparring schema (position, reasons, risks, recommendation). |
 | `lane --kind gegenposition\|premortem\|alternative --prompt-file <abs>` | Ephemeral fork of the thread; one schema retry by forking again. |
 | `worker start --zone <abs> --brief-file <abs> [--effort] [--deadline-min 20] [--model <name>]` | Validates the zone and the brief (ten mandatory headings), appends the worker contract, starts Codex detached with `workspace-write` confined to the zone. |
-| `worker status [id]`, `worker wait <id> [--poll-sec 5]`, `worker cancel <id>` | Lifecycle: results are validated after the process exits, deadlines and cancels kill the verified process tree and wait for it to disappear, usage is booked from the log. `cancel` and `stop` refresh first and keep the report of a worker that already finished (it ends as `done`, not `cancelled`). The exit code of the detached process is recorded (`exitCode`, appended to the log by a tiny launcher), and a report that Codex left only in its log is accepted as `resultSource: "log"`. |
+| `worker status [id]`, `worker wait <id> [--poll-sec 5]`, `worker cancel <id>` | Lifecycle: results are validated after the process exits, deadlines and cancels kill the verified process tree and wait for it to disappear, usage is booked from the log. `cancel` and `stop` refresh first and keep the report of a worker that already finished (it ends as `done`, not `cancelled`). A worker in `killing` is killed again on every refresh as soon as its identity is verifiable; the schema retry rests while tandem is paused or stopped, even for a worker seen finished for the first time. The exit code of the detached process is recorded (`exitCode`, appended to the log by a tiny launcher), and a report that Codex left only in its log is accepted as `resultSource: "log"`. |
 
 ### Contact envelope
 
@@ -202,7 +202,7 @@ references/
   contracts.md          the contracts in prose (for Claude)
 tests/
   fake-codex.mjs        simulates codex exec / resume / review / app-server / login
-  *.test.mjs            116 tests, `node --test`
+  *.test.mjs            119 tests, `node --test`
   smoke.mjs             opt-in end-to-end run against the real Codex (costs tokens)
   smoke-workers.mjs     opt-in: lane + sandboxed worker with a safe isolation probe (costs tokens)
 docs/
@@ -219,7 +219,7 @@ Inside a project, tandem keeps everything under `.tandem/` (state, lock, ledger,
 ## Development
 
 ```bash
-npm test                                          # 116 tests against the fake codex, no tokens spent
+npm test                                          # 119 tests against the fake codex, no tokens spent
 node tests/smoke.mjs C:\path\outside\TEMP         # real Codex, low effort, a few thousand tokens
 node tests/smoke-workers.mjs C:\path\outside\TEMP # real Codex: lane + sandboxed worker with isolation probe
 ```

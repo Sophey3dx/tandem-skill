@@ -45,17 +45,24 @@ export function buildWorkerArgs({ zone, effort, outFile, model = null }) {
 // before codex starts and appends a final {"type":"tandem.exit"} line to the log when codex exits, so the
 // exit code of a process nobody waits for is known. The pid is the launcher (`taskkill /T` kills its tree;
 // on POSIX the detached process leads its own group). Identity (start time) is captured by the caller.
-export function spawnDetachedCodex({ args, stdinFile, logFile, cwd, env = process.env }) {
+// Resolves once the launcher process exists; a start failure (e.g. a cwd that vanished after the zone check)
+// rejects with the spawn error instead of surfacing as an unhandled 'error' event.
+export async function spawnDetachedCodex({ args, stdinFile, logFile, cwd, env = process.env }) {
   const { cmd, prefix } = resolveCodex(env);
   const inFd = fs.openSync(stdinFile, "r");
   const outFd = fs.openSync(logFile, "a");
   let child;
   try {
     child = spawn(process.execPath, [LAUNCHER, logFile, cmd, ...prefix, ...args], { cwd, env, detached: true, stdio: [inFd, outFd, outFd], windowsHide: true });
+    await new Promise((resolve, reject) => {
+      child.once("spawn", resolve);
+      child.once("error", reject);
+    });
   } finally {
     fs.closeSync(inFd);
     fs.closeSync(outFd);
   }
+  child.on("error", () => {}); // never let a late error event crash the runner
   child.unref();
   return { pid: child.pid };
 }
@@ -117,7 +124,7 @@ function finish(state, worker, status, now, extra = {}) {
 // Kills only a process that is verifiably ours (pid AND start time), then waits up to KILL_CONFIRM_MS for it
 // to disappear. Without a verified identity nothing is ever killed: an unknown identity (never captured), an
 // unverifiable one (the start-time query fails right now) and a record without a pid all leave the worker
-// active as `killing`.
+// active as `killing`; every refresh tries again.
 export function killWorker(worker, env = process.env) {
   if (worker.pid === null || worker.pid === undefined) return { gone: false, killed: false, reason: "starting" };
   const state = processState(worker);
@@ -164,17 +171,24 @@ async function retryWorkerResult(state, worker, { project, layout, env }) {
   return { ...parseReplyFile(worker.resultPath, "worker-result"), source: "retry" };
 }
 
+// The retry is a model call: while tandem is paused or stopped it rests as `retry_pending`, exactly like a
+// retry the budget guard refused. The finished run's usage is booked either way.
 async function settleResult(state, worker, { project, layout, env, now }) {
   const found = readWorkerResult(worker);
   let outcome = found
     ? { ...parseReplyText(found.raw, "worker-result"), source: found.source }
     : { parsed: null, errors: [`reply file missing: ${worker.resultPath}`], source: null };
-  if (!outcome.parsed && !worker.retried) outcome = await retryWorkerResult(state, worker, { project, layout, env });
+  if (!outcome.parsed && !worker.retried) {
+    outcome = state.paused || state.stopped
+      ? { parsed: null, errors: [...outcome.errors, "retry pending: tandem is paused or stopped"], pending: true }
+      : await retryWorkerResult(state, worker, { project, layout, env });
+  }
   if (outcome.parsed) {
     finish(state, worker, outcome.parsed.status.toLowerCase(), now, { result: outcome.parsed, resultSource: outcome.source });
   } else if (outcome.pending) {
     worker.status = "retry_pending"; // not terminal, zone free; retried on the next refresh
     worker.retryErrors = outcome.errors;
+    bookWorkerUsage(state, worker); // the original run is over; its tokens count now, not after the retry
   } else if (outcome.failure) {
     finish(state, worker, "failed", now, { failure: outcome.failure, errors: outcome.errors });
   } else {
@@ -254,7 +268,19 @@ export async function refreshWorkers(state, { project, layout, now = Date.now(),
     const alive = sameProcess(worker);
     const hasResult = fs.existsSync(worker.resultPath);
     if (worker.status === "killing") {
-      if (alive) continue;
+      if (alive) {
+        // Try again on every refresh: a kill that failed, or that was blocked by an unverifiable identity,
+        // must not leave a worker (and its zone) active forever once the identity is verifiable again.
+        const kill = killWorker(worker, env);
+        if (!kill.gone) {
+          const blockedBy = kill.reason ?? "kill_failed";
+          if (worker.killBlockedBy !== blockedBy) {
+            worker.killBlockedBy = blockedBy;
+            changed = true;
+          }
+          continue;
+        }
+      }
       await settleGone(state, worker, ctx, () => finish(state, worker, worker.killReason, now, { killFailed: false }));
       changed = true;
       continue;

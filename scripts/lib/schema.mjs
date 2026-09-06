@@ -110,6 +110,13 @@ export function semanticErrors(schemaName, value, { idPrefix, round } = {}) {
     if (value?.status === "DONE" && (remaining.length > 0 || blockers.length > 0)) errors.push("$.status: DONE contradicts remaining work or blockers");
     if (value?.status === "BLOCKED" && blockers.length === 0) errors.push("$.status: BLOCKED requires at least one blocker with evidence");
     if (value?.status === "PARTIAL" && remaining.length === 0) errors.push("$.status: PARTIAL requires remaining work");
+    blockers.forEach((blocker, index) => {
+      if (!String(blocker?.text ?? "").trim()) errors.push(`$.blockers[${index}].text: must not be empty`);
+      if (!String(blocker?.evidence ?? "").trim()) errors.push(`$.blockers[${index}].evidence: must not be empty`);
+    });
+    remaining.forEach((item, index) => {
+      if (!String(item ?? "").trim()) errors.push(`$.remaining[${index}]: must not be empty`);
+    });
   }
   return errors;
 }

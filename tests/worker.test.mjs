@@ -132,6 +132,7 @@ test("a budget refusal before the retry leaves it pending (not consumed); a quot
   const pending = runTandem(["worker", "wait", w1.json.worker.id, "--poll-sec", "1"], { cwd: dir, env });
   assert.equal(pending.json.worker.status, "retry_pending", JSON.stringify(pending.json));
   assert.notEqual(pending.json.worker.retried, true, "a refused retry is not consumed");
+  assert.equal(stateOf(dir).usage.byKind.worker.runs, 1, "the finished run is booked while the retry is pending");
   assert.equal(readLog(logFile).filter((c) => c.argv[1] === "resume").length, 0, "no model call while the budget refuses");
   assert.equal(runTandem(["worker", "status"], { cwd: dir, env: { ...env, FAKE_USED_PRIMARY_SEQUENCE: "18,97,97" } }).json.active, 0, "zone is free while pending");
   const done = runTandem(["worker", "status", w1.json.worker.id], { cwd: dir, env });
@@ -180,7 +181,7 @@ test("a failed kill keeps the worker active as 'killing' and the zone reserved; 
   assert.equal(failed.json.worker.status, "killing");
   assert.equal(failed.json.worker.killFailed, true);
   assert.equal(failed.json.gone, false);
-  assert.equal(runTandem(["worker", "start", "--zone", zone, "--brief-file", brief], { cwd: dir }).json.error, "bad_zone", "zone stays reserved while killing");
+  assert.equal(runTandem(["worker", "start", "--zone", zone, "--brief-file", brief], { cwd: dir, env: { TANDEM_TEST_NO_KILL: "1" } }).json.error, "bad_zone", "zone stays reserved while killing (the refresh retries the kill; here it keeps failing)");
   const state = stateOf(dir);
   // Simulate a recycled pid: the recorded identity no longer matches the live process → tandem must treat
   // its worker as gone and must NOT kill the live process.
@@ -412,4 +413,66 @@ test("wait validates --poll-sec and --timeout-min", () => {
   assert.equal(runTandem(["worker", "wait", "W1", "--poll-sec", "0"], { cwd: dir }).json.error, "bad_args");
   assert.equal(runTandem(["worker", "wait", "W1", "--timeout-min", "x"], { cwd: dir }).json.error, "bad_deadline");
   assert.equal(runTandem(["worker", "wait", "W1", "--poll-sec", "1"], { cwd: dir }).json.worker.status, "done");
+});
+
+test("an invalid result of a worker that finished while tandem is paused or stopped rests as retry_pending (no model call)", () => {
+  const { dir, zone, brief, logFile } = prepared("worker-retry-paused-late");
+  const env = { FAKE_CODEX_LOG: logFile, FAKE_WORKER_INVALID: "1" };
+  const a = runTandem(["worker", "start", "--zone", zone, "--brief-file", brief], { cwd: dir, env });
+  assert.equal(a.json.ok, true, JSON.stringify(a.json));
+  sleepSync(1500); // the fake has exited with an invalid report; no refresh has seen it yet
+  runTandem(["pause"], { cwd: dir });
+  const paused = runTandem(["worker", "status", "W1"], { cwd: dir, env });
+  assert.equal(paused.json.workers[0].status, "retry_pending", JSON.stringify(paused.json));
+  assert.equal(readLog(logFile).filter((c) => c.argv[1] === "resume").length, 0, "no model call while paused");
+  assert.equal(stateOf(dir).usage.byKind.worker.runs, 1, "the finished run is booked");
+  // Same for stop, in a fresh project: the worker is seen finished for the first time by stop itself.
+  const second = prepared("worker-retry-stopped-late");
+  const env2 = { FAKE_CODEX_LOG: second.logFile, FAKE_WORKER_INVALID: "1" };
+  const b = runTandem(["worker", "start", "--zone", second.zone, "--brief-file", second.brief], { cwd: second.dir, env: env2 });
+  assert.equal(b.json.ok, true, JSON.stringify(b.json));
+  sleepSync(1500);
+  const stopped = runTandem(["stop"], { cwd: second.dir, env: env2 });
+  assert.equal(readLog(second.logFile).filter((c) => c.argv[1] === "resume").length, 0, "stop never starts a retry, even for a worker it sees finished for the first time");
+  assert.equal(stopped.json.cancelledWorkers, 1, JSON.stringify(stopped.json));
+  assert.equal(runTandem(["worker", "status", "W1"], { cwd: second.dir, env: env2 }).json.workers[0].status, "cancelled");
+  assert.equal(stateOf(second.dir).usage.byKind.worker.runs, 1, "the finished run is booked by stop as well");
+});
+
+test("a blocked kill is retried on every refresh: once the identity is verifiable again the worker is killed", () => {
+  const { dir, zone, brief } = prepared("worker-kill-retry");
+  const a = runTandem(["worker", "start", "--zone", zone, "--brief-file", brief, "--deadline-min", "5"], { cwd: dir, env: { FAKE_CODEX_MODE: "hang" } });
+  assert.equal(a.json.ok, true, JSON.stringify(a.json));
+  const hiccup = { TANDEM_TEST_START_TIME_FAIL: "1" };
+  const blocked = runTandem(["worker", "cancel", "W1"], { cwd: dir, env: hiccup });
+  assert.equal(blocked.json.worker.status, "killing");
+  assert.equal(blocked.json.worker.killBlockedBy, "identity_unverified");
+  const still = runTandem(["worker", "status", "W1"], { cwd: dir, env: hiccup });
+  assert.equal(still.json.workers[0].status, "killing", "still blocked while the query keeps failing");
+  const after = runTandem(["worker", "status", "W1"], { cwd: dir }); // the query works again: a plain status kills
+  assert.equal(after.json.workers[0].status, "cancelled", JSON.stringify(after.json));
+  assert.equal(after.json.active, 0);
+  // Same for a deadline: the timeout is enforced by wait/status even after a transient query failure.
+  const zone2 = path.join(dir, "zone2");
+  fs.mkdirSync(zone2);
+  const b = runTandem(["worker", "start", "--zone", zone2, "--brief-file", brief, "--deadline-min", "0.02"], { cwd: dir, env: { FAKE_CODEX_MODE: "hang" } });
+  assert.equal(b.json.ok, true, JSON.stringify(b.json));
+  sleepSync(1500);
+  const late = runTandem(["worker", "status", b.json.worker.id], { cwd: dir, env: hiccup });
+  assert.equal(late.json.workers[0].status, "killing", JSON.stringify(late.json));
+  assert.equal(late.json.workers[0].killReason, "timeout");
+  const waited = runTandem(["worker", "wait", b.json.worker.id, "--poll-sec", "1"], { cwd: dir });
+  assert.equal(waited.json.worker.status, "timeout", JSON.stringify(waited.json));
+});
+
+test("a launcher that cannot be started rejects with the spawn error instead of an unhandled error event", async () => {
+  const { spawnDetachedCodex } = await import("../scripts/lib/workers.mjs");
+  const { FAKE } = await import("./helpers.mjs");
+  const dir = makeProject("worker-spawn-error");
+  const brief = writeFile(dir, "brief.md", BRIEF);
+  const logFile = path.join(dir, "log.txt");
+  await assert.rejects(
+    spawnDetachedCodex({ args: ["exec"], stdinFile: brief, logFile, cwd: path.join(dir, "vanished"), env: { ...process.env, TANDEM_CODEX_BIN: FAKE } }),
+    /ENOENT/
+  );
 });

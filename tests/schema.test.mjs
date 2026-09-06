@@ -102,6 +102,10 @@ test("sparring and worker-result semantics", () => {
   assert.ok(semanticErrors("worker-result", { ...done, status: "BLOCKED" }).some((e) => e.includes("BLOCKED requires")));
   assert.ok(semanticErrors("worker-result", { ...done, status: "PARTIAL" }).some((e) => e.includes("PARTIAL requires")));
   assert.deepEqual(semanticErrors("worker-result", { ...done, status: "BLOCKED", blockers: [{ text: "t", evidence: "e" }] }), []);
+  assert.ok(semanticErrors("worker-result", { ...done, status: "BLOCKED", blockers: [{ text: "", evidence: "" }] }).some((e) => e.includes("blockers[0].text")), "an empty blocker is no blocker");
+  assert.ok(semanticErrors("worker-result", { ...done, status: "BLOCKED", blockers: [{ text: "t", evidence: " " }] }).some((e) => e.includes("blockers[0].evidence")));
+  assert.ok(semanticErrors("worker-result", { ...done, status: "PARTIAL", remaining: [""] }).some((e) => e.includes("remaining[0]")), "an empty remaining item is no remaining work");
+  assert.deepEqual(semanticErrors("worker-result", { ...done, status: "PARTIAL", remaining: ["rest"] }), []);
   assert.equal(schemaPath("worker-result").endsWith("worker-result.schema.json"), true);
 });
 

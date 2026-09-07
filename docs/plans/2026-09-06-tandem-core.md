@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - Spec: `docs/2026-09-06-tandem-design.md` (Abschnitte 2, 3, 4.1, 4.2, 4.5, 5, 6, 7, 8, 9, 10). Bei Widerspruch gilt die Spec.
-- Arbeitsverzeichnis für **alle** Befehle in diesem Plan: `C:\Users\david\.claude\skills\tandem` (eigenes Git-Repo, Branch `main`, Identity global gesetzt).
+- Arbeitsverzeichnis für **alle** Befehle in diesem Plan: `~\.claude\skills\tandem` (eigenes Git-Repo, Branch `main`, Identity global gesetzt).
 - Node ≥ 18.18, ESM, **keine** npm-Abhängigkeiten. Tests mit `node --test`.
 - Prompts an Codex **immer** per stdin aus einer Datei (Windows-Kniff), nie als Positional-Argument.
 - **Alle** Pfade, die an Codex gehen (Schema, `-o`, `-C`), sind absolut.
@@ -3306,7 +3306,7 @@ Zehn Punkte, alle übernommen: atomarer Lock mit `wx` und Besitzer-Token (Task 3
 ## Abnahme von Plan A (nach Task 15)
 
 1. `npm test` grün.
-2. Smoke gegen echtes Codex auf Zuruf des Nutzers: `node tests/smoke.mjs C:\Users\david\tandem-smoke` (Effort low, wenige Tokens), Ordner danach löschen.
+2. Smoke gegen echtes Codex auf Zuruf des Nutzers: `node tests/smoke.mjs ~\tandem-smoke` (Effort low, wenige Tokens), Ordner danach löschen.
 3. Duofold-Abschluss-Bug-Check (`fix`-Modus) auf dem echten Diff des Skill-Repos, echte Bugs fixen.
 4. CLAUDE.md-Eintrag für `/tandem` (Plan D enthält die endgültige Form; hier reicht der Kern-Eintrag: Trigger, Kurzbeschreibung, Hinweis „Kontakte nur nach Protokoll").
 

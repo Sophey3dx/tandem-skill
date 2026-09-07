@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - Spec: `docs/2026-09-06-tandem-design.md` (Abschnitte 4.3, 4.4 inkl. Zuteilung nach Stärken, 5, 6, 7, 8, 9, 10). Bei Widerspruch gilt die Spec.
-- Arbeitsverzeichnis für **alle** Befehle: `C:\Users\david\.claude\skills\tandem`, Branch `feat/plan-b` von `main`.
+- Arbeitsverzeichnis für **alle** Befehle: `~\.claude\skills\tandem`, Branch `feat/plan-b` von `main`.
 - Alle Konventionen aus Plan A gelten weiter: eine JSON-Zeile pro Runner-Aufruf, absolute Pfade, Prompts per stdin/Datei, strict Schemas + semantische Prüfung, Wächter vor **jedem** Modellaufruf (auch dem Worker-Schema-Retry), fehlgeschlagene Kontakte werden verbucht, Lock über `withLock`, Quota-Fehler pausieren tandem, Usage aus Events mit stderr-Fallback.
 - **Nur Worker** laufen mit `workspace-write`, und nur mit `-C <zone>`; der Tandem-Thread, Lanes und der Worker-Schema-Retry bleiben `read-only`. Nie `--dangerously-bypass-approvals-and-sandbox`.
 - Zonen: absolut, im Projekt (nach realpath), nicht Projekt-Root, nicht unter `%TEMP%`/`%TMP%`, existent, kein Reparse Point im Pfad (Vorfahren eingeschlossen), nicht unter `.tandem/` (Ausnahme `.tandem/design/<N>/…`), kein Segment und kein Inhalt aus `node_modules|dist|build|.next|target|.git`, keine Reparse Points darin, unlesbare Unterordner → Ablehnung, keine Überlappung mit aktiven Zonen, max. **2** aktive Worker (aktiv = running, finishing, killing).
@@ -1776,7 +1776,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ## Abnahme von Plan B
 
 1. `npm test` grün.
-2. Smoke gegen echtes Codex auf Zuruf: `node tests/smoke-workers.mjs C:\Users\david\tandem-smoke` (low effort), danach Ordner löschen. Prüft `codex exec fork --ephemeral` mit Schema (Spec 12.2), einen echten Worker in einer Zone und den sicheren Isolations-Negativtest (`../leak.txt` muss blockiert werden).
+2. Smoke gegen echtes Codex auf Zuruf: `node tests/smoke-workers.mjs ~\tandem-smoke` (low effort), danach Ordner löschen. Prüft `codex exec fork --ephemeral` mit Schema (Spec 12.2), einen echten Worker in einer Zone und den sicheren Isolations-Negativtest (`../leak.txt` muss blockiert werden).
 3. Abschluss nach Spec 4.5 mit tandem selbst: `review --base main` auf dem Branch und `contact --kind final` auf dem Dauer-Thread des Skill-Repos; echte Befunde fixen, bis das Schlussurteil OK ist.
 4. Merge nach `main`, Push nach GitHub, Datum in „Abnahme Plan B" eintragen.
 
